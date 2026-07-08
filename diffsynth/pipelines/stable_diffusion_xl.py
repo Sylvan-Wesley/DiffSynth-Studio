@@ -54,8 +54,9 @@ class StableDiffusionXLPipeline(BasePipeline):
         self.model_fn = model_fn_stable_diffusion_xl
         self.compilable_models = ["unet"]
 
-    @staticmethod
+    @classmethod
     def from_pretrained(
+        cls,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Union[str, torch.device] = get_device_type(),
         model_configs: list[ModelConfig] = [],
@@ -63,7 +64,7 @@ class StableDiffusionXLPipeline(BasePipeline):
         tokenizer_2_config: ModelConfig = None,
         vram_limit: float = None,
     ):
-        pipe = StableDiffusionXLPipeline(device=device, torch_dtype=torch_dtype)
+        pipe = cls(device=device, torch_dtype=torch_dtype)
         # Override vram_config to use the specified torch_dtype for all models
         for mc in model_configs:
             mc._vram_config_override = {
@@ -152,6 +153,164 @@ class StableDiffusionXLPipeline(BasePipeline):
             inputs_shared["latents"] = self.step(
                 self.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs_shared
             )
+
+        # 6. VAE decode
+        self.load_models_to_device(['vae'])
+        latents = inputs_shared["latents"] / self.vae.scaling_factor
+        image = self.vae.decode(latents)
+        image = self.vae_output_to_image(image)
+        self.load_models_to_device([])
+
+        return image
+
+class StableDiffusionXLConsistencyPipeline(StableDiffusionXLPipeline):
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt,
+        negative_prompt="",
+        step_num=4,
+        cfg_scale=1.0,
+        height=1024,
+        width=1024,
+        seed=None,
+        rand_device="cpu",
+        num_inference_steps=1000,
+        guidance_rescale=0.0,
+        noise_scale=1.0,
+        progress_bar_cmd=tqdm,
+    ):
+        step_num = int(step_num)
+        if step_num <= 0:
+            raise ValueError("`step_num` must be positive.")
+
+        # 1. Scheduler
+        self.scheduler.set_timesteps(num_inference_steps)
+
+        # 2. Three-dict input preparation
+        inputs_posi = {
+            "prompt": prompt,
+        }
+        inputs_nega = {
+            "prompt": negative_prompt,
+        }
+        inputs_shared = {
+            "cfg_scale": cfg_scale,
+            "height": height, "width": width,
+            "seed": seed, "rand_device": rand_device,
+            "guidance_rescale": guidance_rescale,
+            "noise_scale": noise_scale,
+            "crops_coords_top_left": (0, 0),
+        }
+
+        # 3. Unit chain execution
+        for unit in self.units:
+            inputs_shared, inputs_posi, inputs_nega = self.unit_runner(
+                unit, self, inputs_shared, inputs_posi, inputs_nega
+            )
+
+        # 4. Denoise loop
+        self.load_models_to_device(self.in_iteration_models)
+        models = {name: getattr(self, name) for name in self.in_iteration_models}
+        def alpha_sigma(timestep):
+            timestep_int = int(round(timestep.flatten()[0].detach().float().cpu().item()))
+            timestep_int = max(0, min(timestep_int, len(self.scheduler.alphas_cumprod) - 1))
+            alpha_prod = torch.tensor(
+                self.scheduler.alphas_cumprod[timestep_int],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            alpha = torch.sqrt(torch.clamp(alpha_prod, min=1e-12))
+            sigma = torch.sqrt(torch.clamp(1.0 - alpha_prod, min=0.0))
+            return alpha, sigma
+
+        def model_output_to_x0(model_output, latents, timestep):
+            alpha, sigma = alpha_sigma(timestep)
+            prediction_type = getattr(self.scheduler, "prediction_type", "epsilon")
+            if prediction_type == "epsilon":
+                return (latents - sigma * model_output) / torch.clamp(alpha, min=1e-6)
+            if prediction_type == "v_prediction":
+                return alpha * latents - sigma * model_output
+            raise NotImplementedError(f"{prediction_type} is not implemented for consistency sampling.")
+
+        transition_noise_generator = None
+        if seed is not None:
+            transition_noise_generator = torch.Generator(rand_device).manual_seed(int(seed) + 1)
+
+        def randn_like_latents(latents):
+            noise = torch.randn(
+                latents.shape,
+                generator=transition_noise_generator,
+                device=rand_device,
+                dtype=self.torch_dtype,
+            )
+            return noise.to(dtype=latents.dtype, device=latents.device)
+
+        timesteps = self.scheduler.timesteps
+        max_id_int = int(timesteps.shape[0]) - 1
+        ids = torch.linspace(0, max_id_int, steps=step_num, device=self.device).round().long()
+        stop_turn = ids.shape[0] - 1
+
+        for i, t_id in enumerate(progress_bar_cmd(ids)):
+            t_id_int = int(t_id.item())
+            current_timestep = timesteps[t_id_int:t_id_int + 1].to(dtype=torch.float32, device=self.device)
+            noise_pred = self.cfg_guided_model_fn(
+                self.model_fn, cfg_scale,
+                inputs_shared, inputs_posi, inputs_nega,
+                **models, timestep=current_timestep, progress_id=t_id_int
+            )
+            if guidance_rescale > 0.0:
+                # cfg_guided_model_fn already applied CFG, now apply rescale
+                # We need the text-only prediction for rescale
+                noise_pred_text = self.model_fn(
+                    self.unet,
+                    inputs_shared["latents"],
+                    current_timestep,
+                    inputs_posi["prompt_embeds"],
+                    pooled_prompt_embeds=inputs_posi["pooled_prompt_embeds"],
+                    add_time_ids=inputs_posi["add_time_ids"],
+                )
+                noise_pred = rescale_noise_cfg(
+                    noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
+                )
+
+            x_g = model_output_to_x0(noise_pred, inputs_shared["latents"], current_timestep)
+            if i == stop_turn:
+                inputs_shared["latents"] = x_g
+            else:
+                next_id_int = int(ids[i + 1].item())
+                next_timestep = timesteps[next_id_int:next_id_int + 1].to(dtype=torch.float32, device=self.device)
+                next_alpha, next_sigma = alpha_sigma(next_timestep)
+                generator_noise = randn_like_latents(inputs_shared["latents"]) * noise_scale
+                inputs_shared["latents"] = next_alpha * x_g + next_sigma * generator_noise
+
+        # for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
+        #     timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+        #     noise_pred = self.cfg_guided_model_fn(
+        #         self.model_fn, cfg_scale,
+        #         inputs_shared, inputs_posi, inputs_nega,
+        #         **models, timestep=timestep, progress_id=progress_id
+        #     )
+
+        #     # Apply guidance_rescale
+        #     if guidance_rescale > 0.0:
+        #         # cfg_guided_model_fn already applied CFG, now apply rescale
+        #         # We need the text-only prediction for rescale
+        #         noise_pred_text = self.model_fn(
+        #             self.unet,
+        #             inputs_shared["latents"],
+        #             timestep,
+        #             inputs_posi["prompt_embeds"],
+        #             pooled_prompt_embeds=inputs_posi["pooled_prompt_embeds"],
+        #             add_time_ids=inputs_posi["add_time_ids"],
+        #         )
+        #         noise_pred = rescale_noise_cfg(
+        #             noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
+        #         )
+
+        #     inputs_shared["latents"] = self.step(
+        #         self.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs_shared
+        #     )
 
         # 6. VAE decode
         self.load_models_to_device(['vae'])
