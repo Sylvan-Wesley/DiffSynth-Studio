@@ -261,10 +261,11 @@ class FlowMatchScheduler():
             timestep = timestep.cpu()
         timestep_id = torch.argmin((self.timesteps - timestep).abs())
         sigma = self.sigmas[timestep_id]
-        if to_final or timestep_id + 1 >= len(self.timesteps):
+        skip_step = kwargs.get("skip", 1)
+        if to_final or timestep_id + skip_step >= len(self.timesteps):
             sigma_ = 0
         else:
-            sigma_ = self.sigmas[timestep_id + 1]
+            sigma_ = self.sigmas[timestep_id + skip_step]
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
     

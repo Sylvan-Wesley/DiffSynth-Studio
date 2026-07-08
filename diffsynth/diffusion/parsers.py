@@ -55,6 +55,16 @@ def add_lora_config(parser: argparse.ArgumentParser):
     parser.add_argument("--preset_lora_model", type=str, default=None, help="Which model the preset LoRA is fused to.")
     return parser
 
+def add_dmd_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--dmd_tau", type=float, default=0.0, help="StartDMD target sigma tau. DMD training currently supports only 0.0.")
+    parser.add_argument("--dmd_dfake_gen_ratio", type=int, default=5, help="Number of fake-score updates per generator update.")
+    parser.add_argument("--dmd_batch_size", type=int, default=1, help="Batch size for DMD training batches.")
+    parser.add_argument("--dmd_generator_lora_checkpoint", type=str, default=None, help="Initial generator LoRA checkpoint for DMD.")
+    parser.add_argument("--dmd_fake_score_lora_checkpoint", type=str, default=None, help="Initial fake-score LoRA checkpoint for DMD.")
+    parser.add_argument("--dmd_real_score_lora_checkpoint", type=str, default=None, help="Optional frozen real-score LoRA checkpoint for DMD.")
+    parser.add_argument("--dmd_step", type=int, default=4, help="Number of inference step for the generator")
+    return parser
+
 def add_gradient_config(parser: argparse.ArgumentParser):
     parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
@@ -84,6 +94,7 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_training_config(parser)
     parser = add_output_config(parser)
     parser = add_lora_config(parser)
+    parser = add_dmd_config(parser)
     parser = add_gradient_config(parser)
     parser = add_template_model_config(parser)
     parser = add_offload_training_config(parser)

@@ -1,6 +1,6 @@
 import torch, os, argparse, accelerate
 from diffsynth.core import UnifiedDataset
-from diffsynth.pipelines.stable_diffusion_xl import StableDiffusionXLPipeline, ModelConfig
+from diffsynth.pipelines.stable_diffusion_xl import StableDiffusionXLPipeline, ModelConfig, SDXLUnit_PromptEmbedder, SDXLUnit_AddTimeIdsComputer
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -9,9 +9,12 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
         model_paths=None, model_id_with_origin_paths=None,
-        tokenizer_path=None,
+        tokenizer_path=None, tokenizer_2_path=None,
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        dmd_generator_lora_checkpoint=None,
+        dmd_fake_score_lora_checkpoint=None,
+        dmd_real_score_lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
@@ -19,6 +22,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
         fp8_models=None,
         offload_models=None,
         resume_from_checkpoint=None, remove_prefix_in_ckpt=None,
+        prompt_only_height=1024, prompt_only_width=1024,
         device="cpu",
         task="sft",
     ):
@@ -26,18 +30,31 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = self.parse_path_or_model_id(tokenizer_path, ModelConfig(model_id="stabilityai/stable-diffusion-xl-base-1.0", origin_file_pattern="tokenizer/"))
-        tokenizer_2_config = self.parse_path_or_model_id(tokenizer_path, ModelConfig(model_id="stabilityai/stable-diffusion-xl-base-1.0", origin_file_pattern="tokenizer_2/"))
-        self.pipe = StableDiffusionXLPipeline.from_pretrained(torch_dtype=torch.float32, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, tokenizer_2_config=tokenizer_2_config)
+        tokenizer_2_config = self.parse_path_or_model_id(tokenizer_2_path, ModelConfig(model_id="stabilityai/stable-diffusion-xl-base-1.0", origin_file_pattern="tokenizer_2/"))
+        self.pipe = StableDiffusionXLPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, tokenizer_2_config=tokenizer_2_config)
+        self.prompt_only_height = prompt_only_height or 1024
+        self.prompt_only_width = prompt_only_width or 1024
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
 
         # Training mode
-        self.switch_pipe_to_training_mode(
-            self.pipe, trainable_models,
-            lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
-            preset_lora_path, preset_lora_model,
-            task=task,
-        )
+        if task in ("dmd", "dmd:train"):
+            self.setup_dmd_model_roles(
+                self.pipe,
+                lora_target_modules=lora_target_modules,
+                lora_rank=lora_rank,
+                generator_lora_checkpoint=dmd_generator_lora_checkpoint,
+                fake_score_lora_checkpoint=dmd_fake_score_lora_checkpoint,
+                real_score_lora_checkpoint=dmd_real_score_lora_checkpoint,
+                base_model_name=lora_base_model,
+            )
+        else:
+            self.switch_pipe_to_training_mode(
+                self.pipe, trainable_models,
+                lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
+                preset_lora_path, preset_lora_model,
+                task=task,
+            )
         
         # Other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -52,17 +69,39 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            # DMD intentionally reuses the SFT dataset/cache schema.
+            # Prefer running sft:data_process first; this alias is equivalent.
+            "dmd:data_process": lambda pipe, *args: args,
+            "dmd:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega, dmd_update, tau, dmd_step: StartDMDLossDDIM(
+                pipe, **inputs_shared, **inputs_posi, dmd_update=dmd_update, tau=tau, step_num=dmd_step
+            ),
+            "meanflow:data_process": lambda pipe, *args: args,
         }
         
     def get_pipeline_inputs(self, data):
+        if "prompt" not in data:
+            raise ValueError("SDXL training data must include a `prompt` field.")
+        image = data.get("image", None)
+        has_image = image is not None and not (isinstance(image, list) and all(item is None for item in image))
+        if not has_image and self.task not in ("dmd", "dmd:train"):
+            raise ValueError("Prompt-only SDXL training is only supported for `dmd` and `dmd:train`.")
+
+        if not has_image:
+            return self.get_prompt_only_dmd_inputs(data)
+
+        if isinstance(image, list):
+            if len(image) != 1:
+                raise ValueError("Image-backed SDXL DMD batches are not supported. Use --dmd_batch_size 1 or a prompt-only dataset.")
+            image = image[0]
+
         inputs_posi = {"prompt": data["prompt"]}
         inputs_nega = {"negative_prompt": ""}
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
-            "input_image": data["image"],
-            "height": data["image"].size[1],
-            "width": data["image"].size[0],
+            "input_image": image,
+            "height": image.size[1],
+            "width": image.size[0],
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -72,13 +111,57 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
+
+    def get_prompt_only_dmd_inputs(self, data):
+        prompt = data["prompt"]
+        if not isinstance(prompt, (str, list, tuple)):
+            raise ValueError("Prompt-only SDXL DMD data must provide `prompt` as a string or a list of strings.")
+        if isinstance(prompt, tuple):
+            prompt = list(prompt)
+        batch_size = len(prompt) if isinstance(prompt, list) else 1
+        height, width = self.pipe.check_resize_height_width(self.prompt_only_height, self.prompt_only_width, verbose=0)
+
+        prompt_embedder = SDXLUnit_PromptEmbedder()
+        add_time_ids_computer = SDXLUnit_AddTimeIdsComputer()
+        with torch.no_grad():
+            inputs_posi = prompt_embedder.process(self.pipe, prompt)
+            inputs_shared = add_time_ids_computer.process(self.pipe, height, width)
+        inputs_nega = {}
+        if inputs_shared["add_time_ids"].shape[0] == 1 and batch_size > 1:
+            inputs_shared["add_time_ids"] = inputs_shared["add_time_ids"].repeat_interleave(batch_size, dim=0)
+
+        inputs_shared.update({
+            "input_latents": torch.zeros(
+                (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
+                dtype=self.pipe.torch_dtype,
+                device=self.pipe.device,
+            ),
+            "height": height,
+            "width": width,
+            "cfg_scale": 1,
+            "rand_device": self.pipe.device,
+            "use_gradient_checkpointing": self.use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "_skip_pipeline_units": True,
+        })
+        inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        return inputs_shared, inputs_posi, inputs_nega
     
-    def forward(self, data, inputs=None):
+    def forward(self, data, inputs=None, generator_loss=0, fake_loss=0, dmd_update=None, tau=None, dmd_step=4):
         if inputs is None: inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
-        for unit in self.pipe.units:
-            inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
-        loss = self.task_to_loss[self.task](self.pipe, *inputs)
+        skip_pipeline_units = inputs[0].pop("_skip_pipeline_units", False)
+        if not skip_pipeline_units:
+            for unit in self.pipe.units:
+                inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+        if self.task in ("dmd", "dmd:train"):
+            if dmd_update is None:
+                dmd_update = "fake_score" if fake_loss else "generator" if generator_loss else None
+            self.set_dmd_update_mode(dmd_update)
+            loss = self.task_to_loss[self.task](self.pipe, *inputs, dmd_update, tau, dmd_step)
+        else:
+            loss = self.task_to_loss[self.task](self.pipe, *inputs)
+
         return loss
 
 
@@ -116,11 +199,15 @@ if __name__ == "__main__":
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
+        tokenizer_2_path=args.tokenizer_2_path,
         trainable_models=args.trainable_models,
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,
         lora_rank=args.lora_rank,
         lora_checkpoint=args.lora_checkpoint,
+        dmd_generator_lora_checkpoint=args.dmd_generator_lora_checkpoint,
+        dmd_fake_score_lora_checkpoint=args.dmd_fake_score_lora_checkpoint,
+        dmd_real_score_lora_checkpoint=args.dmd_real_score_lora_checkpoint,
         preset_lora_path=args.preset_lora_path,
         preset_lora_model=args.preset_lora_model,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
@@ -130,10 +217,13 @@ if __name__ == "__main__":
         offload_models=args.offload_models,
         resume_from_checkpoint=args.resume_from_checkpoint,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        prompt_only_height=args.height or 1024,
+        prompt_only_width=args.width or 1024,
         task=args.task,
         device="cpu" if args.enable_model_cpu_offload else accelerator.device,
     )
-    model_logger = ModelLogger(
+    logger_cls = DMDModelLogger if args.task in ("dmd", "dmd:train") else ModelLogger
+    model_logger = logger_cls(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         enable_tensorboard_log=args.enable_tensorboard_log,
@@ -143,9 +233,12 @@ if __name__ == "__main__":
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
+        # DMD data processing is identical to SFT data processing.
+        "dmd:data_process": launch_data_process_task,
         "sft": launch_training_task,
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "dmd:train": launch_dmd_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

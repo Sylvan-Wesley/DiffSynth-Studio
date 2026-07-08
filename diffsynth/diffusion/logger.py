@@ -78,10 +78,10 @@ class ModelLogger:
         if accelerator.is_main_process:
             if not self.loggers_initialized:
                 self.init_loggers()
-            loss = kwargs.get("loss")
-            if loss is not None:
-                for logger in self.loggers:
-                    logger.log("loss", loss, self.num_steps)
+            for key, value in kwargs.items():
+                if value is not None:
+                    for logger in self.loggers:
+                        logger.log(key, value, self.num_steps)
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
@@ -110,3 +110,46 @@ class ModelLogger:
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+
+
+class DMDModelLogger(ModelLogger):
+    def role_prefix(self, model, role):
+        if hasattr(model, "dmd_role_param_prefix"):
+            return model.dmd_role_param_prefix(role)
+        fallback = {
+            "generator": "pipe.dit.",
+            "fake_score": "pipe.fake_score_dit.",
+        }
+        return fallback[role]
+
+    def export_role_state_dict(self, model, state_dict, role_prefix):
+        trainable_param_names = model.trainable_param_names()
+        role_state_dict = {
+            name[len(role_prefix):]: param
+            for name, param in state_dict.items()
+            if name in trainable_param_names and name.startswith(role_prefix)
+        }
+        return self.state_dict_converter(role_state_dict)
+
+    def save_role_model(self, accelerator: Accelerator, model: torch.nn.Module, state_dict, file_name, role_prefix):
+        role_state_dict = self.export_role_state_dict(model, state_dict, role_prefix)
+        os.makedirs(self.output_path, exist_ok=True)
+        path = os.path.join(self.output_path, file_name)
+        accelerator.save(role_state_dict, path, safe_serialization=True)
+
+    def on_epoch_end(self, accelerator: Accelerator, model: torch.nn.Module, epoch_id):
+        accelerator.wait_for_everyone()
+        state_dict = accelerator.get_state_dict(model)
+        if accelerator.is_main_process:
+            model = accelerator.unwrap_model(model)
+            self.save_role_model(accelerator, model, state_dict, f"epoch-{epoch_id}-generator.safetensors", self.role_prefix(model, "generator"))
+            self.save_role_model(accelerator, model, state_dict, f"epoch-{epoch_id}-fake_score.safetensors", self.role_prefix(model, "fake_score"))
+
+    def save_model(self, accelerator: Accelerator, model: torch.nn.Module, file_name):
+        accelerator.wait_for_everyone()
+        state_dict = accelerator.get_state_dict(model)
+        if accelerator.is_main_process:
+            model = accelerator.unwrap_model(model)
+            base_name = file_name[:-len(".safetensors")] if file_name.endswith(".safetensors") else file_name
+            self.save_role_model(accelerator, model, state_dict, f"{base_name}-generator.safetensors", self.role_prefix(model, "generator"))
+            self.save_role_model(accelerator, model, state_dict, f"{base_name}-fake_score.safetensors", self.role_prefix(model, "fake_score"))

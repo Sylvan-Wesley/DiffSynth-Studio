@@ -12,6 +12,9 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         tokenizer_path=None,
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        dmd_generator_lora_checkpoint=None,
+        dmd_fake_score_lora_checkpoint=None,
+        dmd_real_score_lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
@@ -32,15 +35,28 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         self.pipe = self.load_training_template_model(self.pipe, template_model_id_or_path, args.use_gradient_checkpointing, args.use_gradient_checkpointing_offload)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model, remove_unnecessary_params=True)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
+        if task in ("dmd", "dmd:train") and enable_lora_hot_loading:
+            raise ValueError("DMD trains role-scoped PEFT LoRAs; --enable_lora_hot_loading is not supported.")
         if enable_lora_hot_loading: self.pipe.dit = self.pipe.enable_lora_hot_loading(self.pipe.dit)
 
         # Training mode
-        self.switch_pipe_to_training_mode(
-            self.pipe, trainable_models,
-            lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
-            preset_lora_path, preset_lora_model,
-            task=task,
-        )
+        if task in ("dmd", "dmd:train"):
+            self.setup_dmd_model_roles(
+                self.pipe,
+                lora_target_modules=lora_target_modules,
+                lora_rank=lora_rank,
+                generator_lora_checkpoint=dmd_generator_lora_checkpoint,
+                fake_score_lora_checkpoint=dmd_fake_score_lora_checkpoint,
+                real_score_lora_checkpoint=dmd_real_score_lora_checkpoint,
+                base_model_name=lora_base_model,
+            )
+        else:
+            self.switch_pipe_to_training_mode(
+                self.pipe, trainable_models,
+                lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
+                preset_lora_path, preset_lora_model,
+                task=task,
+            )
 
         # Other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -55,6 +71,14 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            # DMD intentionally reuses the SFT dataset/cache schema.
+            # Prefer running sft:data_process first; this alias is equivalent.
+            "dmd:data_process": lambda pipe, *args: args,
+            "dmd:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega, dmd_update, tau, dmd_step: StartDMDLoss(
+                pipe, **inputs_shared, **inputs_posi, dmd_update=dmd_update, tau=tau, step_num=dmd_step
+            ),
+            "meanflow:data_process": lambda pipe, *args: args,
+            # "meanflow": lambda pipe, inputs_shared, inputs_posi, inputs_nega: MeanFlowLoss(pipe, **inputs_shared, **inputs_posi),
         }
 
     def get_pipeline_inputs(self, data):
@@ -77,12 +101,19 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
 
-    def forward(self, data, inputs=None):
+    def forward(self, data, inputs=None, generator_loss=0, fake_loss=0, dmd_update=None, tau=None, dmd_step=4):
         if inputs is None: inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
-        loss = self.task_to_loss[self.task](self.pipe, *inputs)
+        if self.task in ("dmd", "dmd:train"):
+            if dmd_update is None:
+                dmd_update = "fake_score" if fake_loss else "generator" if generator_loss else None
+            self.set_dmd_update_mode(dmd_update)
+            loss = self.task_to_loss[self.task](self.pipe, *inputs, dmd_update, tau, dmd_step)
+        else:
+            loss = self.task_to_loss[self.task](self.pipe, *inputs)
+
         return loss
 
 
@@ -126,6 +157,9 @@ if __name__ == "__main__":
         lora_target_modules=args.lora_target_modules,
         lora_rank=args.lora_rank,
         lora_checkpoint=args.lora_checkpoint,
+        dmd_generator_lora_checkpoint=args.dmd_generator_lora_checkpoint,
+        dmd_fake_score_lora_checkpoint=args.dmd_fake_score_lora_checkpoint,
+        dmd_real_score_lora_checkpoint=args.dmd_real_score_lora_checkpoint,
         preset_lora_path=args.preset_lora_path,
         preset_lora_model=args.preset_lora_model,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
@@ -140,7 +174,8 @@ if __name__ == "__main__":
         task=args.task,
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
     )
-    model_logger = ModelLogger(
+    logger_cls = DMDModelLogger if args.task in ("dmd", "dmd:train") else ModelLogger
+    model_logger = logger_cls(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         enable_tensorboard_log=args.enable_tensorboard_log,
@@ -150,9 +185,12 @@ if __name__ == "__main__":
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
+        # DMD data processing is identical to SFT data processing.
+        "dmd:data_process": launch_data_process_task,
         "sft": launch_training_task,
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "dmd:train": launch_dmd_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

@@ -83,6 +83,8 @@ class BasePipeline(torch.nn.Module):
         self.unit_runner = PipelineUnitRunner()
         # LoRA Loader
         self.lora_loader = GeneralLoRALoader
+        # Optional mapping from semantic roles to model_fn keyword arguments.
+        self.model_roles = {}
         
         
     def to(self, *args, **kwargs):
@@ -180,6 +182,42 @@ class BasePipeline(torch.nn.Module):
                                     module.onload()
 
 
+    def register_model_role(self, role: str, models: dict[str, str]):
+        if not isinstance(role, str) or role == "":
+            raise ValueError("Model role must be a non-empty string.")
+        if not isinstance(models, dict) or len(models) == 0:
+            raise ValueError("Model role mapping must be a non-empty dict.")
+        for forward_key, attr_name in models.items():
+            if not isinstance(forward_key, str) or forward_key == "":
+                raise ValueError("Model role mapping keys must be non-empty strings.")
+            if not isinstance(attr_name, str) or attr_name == "":
+                raise ValueError("Model role mapping values must be non-empty strings.")
+        self.model_roles[role] = dict(models)
+
+
+    def get_iteration_models(self, role: str = None):
+        models = {
+            name: getattr(self, name)
+            for name in getattr(self, "in_iteration_models", tuple())
+        }
+        if role is None:
+            return models
+        if role not in self.model_roles:
+            raise KeyError(f"Model role {role!r} is not registered.")
+        for forward_key, attr_name in self.model_roles[role].items():
+            models[forward_key] = getattr(self, attr_name)
+        return models
+
+
+    def load_role_models_to_device(self, role: str = None):
+        model_names = list(getattr(self, "in_iteration_models", tuple()))
+        if role is not None:
+            if role not in self.model_roles:
+                raise KeyError(f"Model role {role!r} is not registered.")
+            model_names.extend(self.model_roles[role].values())
+        self.load_models_to_device(sorted(set(model_names)))
+
+
     def generate_noise(self, shape, seed=None, rand_device="cpu", rand_torch_dtype=torch.float32, device=None, torch_dtype=None):
         # Initialize Gaussian noise
         generator = None if seed is None else torch.Generator(rand_device).manual_seed(seed)
@@ -223,7 +261,8 @@ class BasePipeline(torch.nn.Module):
         if inpaint_mask is not None:
             noise_pred_expected = scheduler.return_to_timestep(scheduler.timesteps[progress_id], latents, input_latents)
             noise_pred = self.blend_with_mask(noise_pred_expected, noise_pred, inpaint_mask)
-        latents_next = scheduler.step(noise_pred, timestep, latents)
+        skip = kwargs.get("skip", 1)
+        latents_next = scheduler.step(noise_pred, timestep, latents, skip=skip)
         return latents_next
     
     
@@ -280,9 +319,10 @@ class BasePipeline(torch.nn.Module):
             lora_loader.fuse_lora_to_base_model(module, lora, alpha=alpha)
             
             
-    def clear_lora(self, verbose=1):
+    def clear_lora(self, module: torch.nn.Module = None, verbose=1):
+        root = self if module is None else module
         cleared_num = 0
-        for name, module in self.named_modules():
+        for _, module in root.named_modules():
             if isinstance(module, AutoWrappedLinear):
                 if hasattr(module, "lora_A_weights"):
                     if len(module.lora_A_weights) > 0:
@@ -319,21 +359,25 @@ class BasePipeline(torch.nn.Module):
         return vram_management_enabled
     
     
-    def cfg_guided_model_fn(self, model_fn, cfg_scale, inputs_shared, inputs_posi, inputs_nega, **inputs_others):
+    def cfg_guided_model_fn(self, model_fn, cfg_scale, inputs_shared, inputs_posi, inputs_nega, lora_module=None, **inputs_others):
+        lora_module = lora_module if lora_module is not None else getattr(self, "dit", None)
+        has_lora = inputs_shared.get("positive_only_lora", None) is not None or inputs_shared.get("negative_only_lora", None) is not None
+        if has_lora and lora_module is None:
+            raise ValueError("A LoRA target module is required when positive_only_lora or negative_only_lora is provided.")
         # Positive side forward
         if inputs_shared.get("positive_only_lora", None) is not None:
-            self.load_lora(self.dit, state_dict=inputs_shared["positive_only_lora"], verbose=0)
+            self.load_lora(lora_module, state_dict=inputs_shared["positive_only_lora"], verbose=0)
         noise_pred_posi = model_fn(**inputs_posi, **inputs_shared, **inputs_others)
         if inputs_shared.get("positive_only_lora", None) is not None:
-            self.clear_lora(verbose=0)
+            self.clear_lora(lora_module, verbose=0)
             
         if cfg_scale != 1.0:
             # Negative side forward
             if inputs_shared.get("negative_only_lora", None) is not None:
-                self.load_lora(self.dit, state_dict=inputs_shared["negative_only_lora"], verbose=0)
+                self.load_lora(lora_module, state_dict=inputs_shared["negative_only_lora"], verbose=0)
             noise_pred_nega = model_fn(**inputs_nega, **inputs_shared, **inputs_others)
             if inputs_shared.get("negative_only_lora", None) is not None:
-                self.clear_lora(verbose=0)
+                self.clear_lora(lora_module, verbose=0)
             
             if isinstance(noise_pred_posi, tuple):
                 # Separately handling different output types of latents, eg. video and audio latents.

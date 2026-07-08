@@ -1,4 +1,4 @@
-import torch, json, os, inspect
+import torch, json, os, inspect, copy
 from ..core import ModelConfig, load_state_dict
 from ..utils.controlnet import ControlNetInput
 from .base_pipeline import PipelineUnit
@@ -89,6 +89,54 @@ class DiffusionTrainingModule(torch.nn.Module):
         trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self.named_parameters()))
         trainable_param_names = set([named_param[0] for named_param in trainable_param_names])
         return trainable_param_names
+
+
+    def trainable_parameters_by_prefix(self, prefixes):
+        if isinstance(prefixes, str):
+            prefixes = (prefixes,)
+        return [
+            param
+            for name, param in self.named_parameters()
+            if param.requires_grad and any(name.startswith(prefix) for prefix in prefixes)
+        ]
+
+
+    def dmd_role_model_name(self, role):
+        if not hasattr(self, "pipe"):
+            raise ValueError("DMD role lookup requires a training module with a pipe attribute.")
+        role_attrs = getattr(self.pipe, "dmd_model_role_attrs", None)
+        if role_attrs is None or role not in role_attrs:
+            raise ValueError(f"DMD model role {role!r} is not configured.")
+        return role_attrs[role]
+
+
+    def dmd_role_param_prefix(self, role):
+        return f"pipe.{self.dmd_role_model_name(role)}."
+
+
+    def dmd_generator_parameters(self):
+        return self.trainable_parameters_by_prefix(self.dmd_role_param_prefix("generator"))
+
+
+    def dmd_fake_score_parameters(self):
+        return self.trainable_parameters_by_prefix(self.dmd_role_param_prefix("fake_score"))
+
+
+    def set_dmd_update_mode(self, update):
+        if update not in ("fake_score", "generator"):
+            raise ValueError(f"Unknown DMD update mode: {update!r}.")
+        if not hasattr(self, "pipe"):
+            raise ValueError("DMD update mode requires a training module with a pipe attribute.")
+        generator_model = getattr(self.pipe, self.dmd_role_model_name("generator"))
+        fake_score_model = getattr(self.pipe, self.dmd_role_model_name("fake_score"))
+        real_score_model = getattr(self.pipe, self.dmd_role_model_name("real_score"))
+        real_score_model.eval()
+        if update == "fake_score":
+            generator_model.eval()
+            fake_score_model.train()
+        else:
+            generator_model.train()
+            fake_score_model.eval()
     
     
     def add_lora_to_model(self, model, target_modules, lora_rank, lora_alpha=None, upcast_dtype=None):
@@ -127,6 +175,86 @@ class DiffusionTrainingModule(torch.nn.Module):
                 state_dict_[name] = param
             state_dict = state_dict_
         return state_dict
+
+
+    def load_peft_lora_checkpoint(self, pipe, model, lora_checkpoint):
+        if lora_checkpoint is None:
+            return
+        if isinstance(lora_checkpoint, str):
+            lora = load_state_dict(lora_checkpoint)
+        else:
+            lora = lora_checkpoint
+        lora_loader = pipe.lora_loader(torch_dtype=pipe.torch_dtype, device=pipe.device)
+        lora = lora_loader.convert_state_dict(lora)
+        lora = self.mapping_lora_state_dict(lora)
+        load_result = model.load_state_dict(lora, strict=False)
+        print(f"LoRA checkpoint loaded. Total {len(lora)} keys")
+        if len(load_result[1]) > 0:
+            print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
+
+
+    def setup_dmd_model_roles(
+        self,
+        pipe,
+        lora_target_modules="",
+        lora_rank=32,
+        generator_lora_checkpoint=None,
+        fake_score_lora_checkpoint=None,
+        real_score_lora_checkpoint=None,
+        base_model_name=None,
+    ):
+        pipe.scheduler.set_timesteps(1000, training=True)
+        pipe.freeze_except([])
+
+        if base_model_name is None:
+            in_iteration_models = getattr(pipe, "in_iteration_models", tuple())
+            if len(in_iteration_models) == 0:
+                raise ValueError("Cannot infer DMD base model because pipe.in_iteration_models is empty.")
+            base_model_name = in_iteration_models[0]
+        if not hasattr(pipe, base_model_name) or getattr(pipe, base_model_name) is None:
+            raise ValueError(f"Cannot configure DMD role for missing model {base_model_name!r}.")
+
+        base_model = getattr(pipe, base_model_name)
+        fake_score_model_name = f"fake_score_{base_model_name}"
+        real_score_model_name = f"real_score_{base_model_name}"
+        setattr(pipe, fake_score_model_name, copy.deepcopy(base_model))
+        setattr(pipe, real_score_model_name, copy.deepcopy(base_model))
+
+        lora_target_modules = self.parse_lora_target_modules(base_model, lora_target_modules)
+        generator_model = self.add_lora_to_model(
+            base_model,
+            target_modules=lora_target_modules,
+            lora_rank=lora_rank,
+            upcast_dtype=pipe.torch_dtype,
+        )
+        fake_score_model = self.add_lora_to_model(
+            getattr(pipe, fake_score_model_name),
+            target_modules=lora_target_modules,
+            lora_rank=lora_rank,
+            upcast_dtype=pipe.torch_dtype,
+        )
+        setattr(pipe, base_model_name, generator_model)
+        setattr(pipe, fake_score_model_name, fake_score_model)
+
+        self.load_peft_lora_checkpoint(pipe, generator_model, generator_lora_checkpoint)
+        self.load_peft_lora_checkpoint(pipe, fake_score_model, fake_score_lora_checkpoint)
+        if real_score_lora_checkpoint is not None:
+            pipe.load_lora(getattr(pipe, real_score_model_name), real_score_lora_checkpoint)
+
+        generator_model.train()
+        fake_score_model.train()
+        real_score_model = getattr(pipe, real_score_model_name)
+        real_score_model.eval()
+        real_score_model.requires_grad_(False)
+
+        pipe.dmd_model_role_attrs = {
+            "generator": base_model_name,
+            "fake_score": fake_score_model_name,
+            "real_score": real_score_model_name,
+        }
+        pipe.register_model_role("generator", {base_model_name: base_model_name})
+        pipe.register_model_role("fake_score", {base_model_name: fake_score_model_name})
+        pipe.register_model_role("real_score", {base_model_name: real_score_model_name})
     
     
     def transfer_data_to_device(self, data, device, torch_float_dtype=None):
@@ -337,7 +465,7 @@ class DiffusionTrainingModule(torch.nn.Module):
                     required_params.extend(unit.fetch_input_params())
                 required_params = sorted(list(set(required_params)))
                 pipe.units.append(GeneralUnit_RemoveCache(required_params, force_remove_params_shared, force_remove_params_posi, force_remove_params_nega))
-        elif task.endswith(":train"):
+        elif task.endswith(":train") or task == "dmd":
             pipe.units, _ = pipe.split_pipeline_units(models_require_backward)
         return pipe
     

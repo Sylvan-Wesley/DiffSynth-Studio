@@ -19,6 +19,7 @@ dependencies = [
     "einops",
     "sentencepiece",
     "protobuf",
+    "diffusers>=0.31.0",
     "modelscope",
     "ftfy",
     "pandas",
