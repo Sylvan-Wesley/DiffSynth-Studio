@@ -167,6 +167,7 @@ class DiffusionTrainingModule(torch.nn.Module):
     def export_trainable_state_dict(self, state_dict, remove_prefix=None):
         trainable_param_names = self.trainable_param_names()
         state_dict = {name: param for name, param in state_dict.items() if name in trainable_param_names}
+        state_dict = self.export_lora_alpha_state_dict(state_dict)
         if remove_prefix is not None:
             state_dict_ = {}
             for name, param in state_dict.items():
@@ -175,6 +176,43 @@ class DiffusionTrainingModule(torch.nn.Module):
                 state_dict_[name] = param
             state_dict = state_dict_
         return state_dict
+
+
+    def export_lora_alpha_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        for name, param in list(state_dict.items()):
+            if ".lora_B." not in name or not name.endswith(".weight"):
+                continue
+            module_name, suffix = name.split(".lora_B.", 1)
+            adapter_name = suffix[:-len(".weight")] if suffix.endswith(".weight") else "default"
+            adapter_name = "default" if adapter_name == "" or adapter_name == "weight" else adapter_name
+            alpha_key = name.replace("lora_B.default.weight", "alpha").replace("lora_B.weight", "alpha")
+            if alpha_key in state_dict:
+                continue
+            try:
+                module = self.get_submodule(module_name)
+            except AttributeError:
+                continue
+            rank = int(param.shape[1]) if param.ndim >= 2 else None
+            lora_alpha = self.get_lora_alpha_from_module(module, adapter_name, rank)
+            if lora_alpha is not None:
+                state_dict[alpha_key] = torch.tensor(lora_alpha, dtype=torch.float32, device=param.device)
+        return state_dict
+
+
+    def get_lora_alpha_from_module(self, module, adapter_name="default", rank=None):
+        lora_alpha = getattr(module, "lora_alpha", None)
+        if isinstance(lora_alpha, dict):
+            lora_alpha = lora_alpha.get(adapter_name, lora_alpha.get("default"))
+        if lora_alpha is None and rank is not None:
+            scaling = getattr(module, "scaling", None)
+            if isinstance(scaling, dict):
+                scaling = scaling.get(adapter_name, scaling.get("default"))
+            if scaling is not None:
+                lora_alpha = scaling * rank
+        if isinstance(lora_alpha, torch.Tensor):
+            lora_alpha = lora_alpha.detach().float().item()
+        return None if lora_alpha is None else float(lora_alpha)
 
 
     def load_peft_lora_checkpoint(self, pipe, model, lora_checkpoint):
@@ -198,6 +236,7 @@ class DiffusionTrainingModule(torch.nn.Module):
         pipe,
         lora_target_modules="",
         lora_rank=32,
+        lora_alpha=None,
         generator_lora_checkpoint=None,
         fake_score_lora_checkpoint=None,
         real_score_lora_checkpoint=None,
@@ -225,13 +264,15 @@ class DiffusionTrainingModule(torch.nn.Module):
             base_model,
             target_modules=lora_target_modules,
             lora_rank=lora_rank,
-            upcast_dtype=pipe.torch_dtype,
+            lora_alpha=lora_alpha,
+            upcast_dtype=torch.float32,
         )
         fake_score_model = self.add_lora_to_model(
             getattr(pipe, fake_score_model_name),
             target_modules=lora_target_modules,
             lora_rank=lora_rank,
-            upcast_dtype=pipe.torch_dtype,
+            lora_alpha=lora_alpha,
+            upcast_dtype=torch.float32,
         )
         setattr(pipe, base_model_name, generator_model)
         setattr(pipe, fake_score_model_name, fake_score_model)
@@ -397,6 +438,7 @@ class DiffusionTrainingModule(torch.nn.Module):
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
+        lora_alpha=None,
         task="sft",
     ):
         # Scheduler
@@ -423,7 +465,8 @@ class DiffusionTrainingModule(torch.nn.Module):
                 model,
                 target_modules=self.parse_lora_target_modules(model, lora_target_modules),
                 lora_rank=lora_rank,
-                upcast_dtype=pipe.torch_dtype,
+                lora_alpha=lora_alpha,
+                upcast_dtype=torch.float32,
             )
             if lora_checkpoint is not None:
                 if isinstance(lora_checkpoint, str):

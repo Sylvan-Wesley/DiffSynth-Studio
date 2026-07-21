@@ -145,6 +145,7 @@ def launch_dmd_training_task(
     args = None,
 ):
     dmd_batch_size = 1
+    gradient_accumulation_steps = 1
     if args is not None:
         learning_rate = args.learning_rate
         weight_decay = args.weight_decay
@@ -159,6 +160,7 @@ def launch_dmd_training_task(
         dmd_step = args.dmd_step
         dfake_gen_ratio = args.dmd_dfake_gen_ratio
         dmd_batch_size = getattr(args, "dmd_batch_size", dmd_batch_size)
+        gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     tau = 0.0
 
     generator_params = model.dmd_generator_parameters()
@@ -187,36 +189,84 @@ def launch_dmd_training_task(
         )
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
+    dataloader_len = len(dataloader)
+    total_fake_micro_steps = dataloader_len * dfake_gen_ratio
+    total_gen_micro_steps = dataloader_len
+
+    def accumulation_state(micro_step, total_micro_steps):
+        should_step = micro_step % gradient_accumulation_steps == 0 or micro_step == total_micro_steps
+        remainder = total_micro_steps % gradient_accumulation_steps
+        final_partial_window = remainder != 0 and micro_step > total_micro_steps - remainder
+        effective_accumulation_steps = remainder if final_partial_window else gradient_accumulation_steps
+        loss_scale = gradient_accumulation_steps / effective_accumulation_steps
+        return should_step, loss_scale
+
     for epoch_id in range(num_epochs):
+        fake_micro_step = 0
+        gen_micro_step = 0
         for data in tqdm(dataloader):
             for _ in range(dfake_gen_ratio):
-                with accelerator.accumulate(model):
-                    accelerator.unwrap_model(model).set_dmd_update_mode("fake_score")
-                    # Data is actually never used
-                    if dataset.load_from_cache:
-                        loss_fake = model({}, inputs=data, dmd_update="fake_score", tau=tau, dmd_step=dmd_step)
-                    else:
-                        loss_fake = model(data, dmd_update="fake_score", tau=tau, dmd_step=dmd_step)
-                    accelerator.backward(loss_fake)
-                    if enable_model_cpu_offload:
-                        offload_manager.after_backward()
+                fake_micro_step += 1
+                should_step_fake, fake_loss_scale = accumulation_state(fake_micro_step, total_fake_micro_steps)
+                accelerator.unwrap_model(model).set_dmd_update_mode("fake_score")
+                # Data is actually never used
+                if dataset.load_from_cache:
+                    loss_fake = model({}, inputs=data, dmd_update="fake_score", tau=tau, dmd_step=dmd_step)
+                else:
+                    loss_fake = model(data, dmd_update="fake_score", tau=tau, dmd_step=dmd_step)
+                if should_step_fake:
+                    # DEBUG ONLY: snapshot fake-score LoRA params before backward/step.
+                    fake_before = [p.detach().clone() for p in fake_score_params]
+                accelerator.backward(loss_fake * fake_loss_scale)
+                if should_step_fake:
+                    # DEBUG ONLY: verify fake-score LoRA params receive gradients.
+                    fake_grad_norm = sum(
+                        0.0 if p.grad is None else p.grad.detach().float().norm().item()
+                        for p in fake_score_params
+                    )
+                if enable_model_cpu_offload:
+                    offload_manager.after_backward()
+                if should_step_fake:
                     print(f"**********Fake loss is: {loss_fake}***********")
                     fake_optimizer.step()
+                    # DEBUG ONLY: verify fake-score LoRA params changed after optimizer step.
+                    fake_delta_norm = sum(
+                        (p.detach().float() - before.float()).norm().item()
+                        for p, before in zip(fake_score_params, fake_before)
+                    )
+                    print(f"########## DEBUG ONLY fake_score grad_norm={fake_grad_norm:.6e}, delta_norm={fake_delta_norm:.6e} ##########")
                     fake_scheduler.step()
                     fake_optimizer.zero_grad()
                     model_logger.on_step_end(accelerator, model, save_steps, loss_fake=loss_fake)
 
-            with accelerator.accumulate(model):
-                accelerator.unwrap_model(model).set_dmd_update_mode("generator")
-                if dataset.load_from_cache:
-                    loss_dm = model({}, inputs=data, dmd_update="generator", tau=tau, dmd_step=dmd_step)
-                else:
-                    loss_dm = model(data, dmd_update="generator", tau=tau, dmd_step=dmd_step)
-                accelerator.backward(loss_dm)
-                if enable_model_cpu_offload:
-                    offload_manager.after_backward()
+            gen_micro_step += 1
+            should_step_gen, gen_loss_scale = accumulation_state(gen_micro_step, total_gen_micro_steps)
+            accelerator.unwrap_model(model).set_dmd_update_mode("generator")
+            if dataset.load_from_cache:
+                loss_dm = model({}, inputs=data, dmd_update="generator", tau=tau, dmd_step=dmd_step)
+            else:
+                loss_dm = model(data, dmd_update="generator", tau=tau, dmd_step=dmd_step)
+            if should_step_gen:
+                # DEBUG ONLY: snapshot generator LoRA params before backward/step.
+                gen_before = [p.detach().clone() for p in generator_params]
+            accelerator.backward(loss_dm * gen_loss_scale)
+            if should_step_gen:
+                # DEBUG ONLY: verify generator LoRA params receive gradients.
+                gen_grad_norm = sum(
+                    0.0 if p.grad is None else p.grad.detach().float().norm().item()
+                    for p in generator_params
+                )
+            if enable_model_cpu_offload:
+                offload_manager.after_backward()
+            if should_step_gen:
                 print(f"###########Generator loss is: {loss_dm}#########")
                 gen_optimizer.step()
+                # DEBUG ONLY: verify generator LoRA params changed after optimizer step.
+                gen_delta_norm = sum(
+                    (p.detach().float() - before.float()).norm().item()
+                    for p, before in zip(generator_params, gen_before)
+                )
+                print(f"########## DEBUG ONLY generator grad_norm={gen_grad_norm:.6e}, delta_norm={gen_delta_norm:.6e} ##########")
                 gen_scheduler.step()
                 gen_optimizer.zero_grad()
                 model_logger.on_step_end(accelerator, model, save_steps, loss_dm=loss_dm)

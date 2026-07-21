@@ -200,35 +200,59 @@ def StartDMDLoss(pipe: BasePipeline, **inputs):
     return 0.5 * torch.nn.functional.mse_loss(x_g.float(), target.float())
 
 
-def StartDMDLossDDIM(pipe: BasePipeline, **inputs):
-    if "input_latents" not in inputs or inputs["input_latents"] is None:
+def StartDMDLossDDIM(pipe: BasePipeline, inputs_shared=None, inputs_posi=None, inputs_nega=None, **inputs):
+    if inputs_shared is None:
+        model_inputs_shared = dict(inputs)
+        loss_inputs = model_inputs_shared
+    else:
+        model_inputs_shared = dict(inputs_shared)
+        loss_inputs = dict(model_inputs_shared)
+        loss_inputs.update(inputs)
+    inputs_posi = {} if inputs_posi is None else dict(inputs_posi)
+    inputs_nega = {} if inputs_nega is None else dict(inputs_nega)
+
+    # Note, "" instead of zero embedding is passed in as the negative branch since SDXL is directly trained on it.
+
+    if "input_latents" not in loss_inputs or loss_inputs["input_latents"] is None:
         raise ValueError("StartDMDLossDDIM requires SFT-prepared `input_latents`.")
 
     if not hasattr(pipe.scheduler, "alphas_cumprod"):
         raise ValueError("StartDMDLossDDIM requires a DDIM-style scheduler with `alphas_cumprod`.")
 
-    step_num = int(inputs["step_num"])
+    step_num = int(loss_inputs["step_num"])
     if step_num <= 0:
         raise ValueError("StartDMDLossDDIM requires `step_num` to be positive.")
 
-    tau = 0.0 if inputs.get("tau", None) is None else float(inputs["tau"])
+    tau = 0.0 if loss_inputs.get("tau", None) is None else float(loss_inputs["tau"])
     if tau != 0.0:
         raise ValueError("StartDMDLossDDIM currently supports only tau=0.0.")
 
-    dmd_update = inputs.get("dmd_update", None)
+    dmd_update = loss_inputs.get("dmd_update", None)
     if dmd_update is None:
-        if inputs.get("fake_loss", 0):
+        if loss_inputs.get("fake_loss", 0):
             dmd_update = "fake_score"
-        elif inputs.get("generator_loss", 0):
+        elif loss_inputs.get("generator_loss", 0):
             dmd_update = "generator"
     if dmd_update not in ("fake_score", "generator"):
         raise ValueError("StartDMDLossDDIM requires dmd_update='fake_score' or dmd_update='generator'.")
 
     timesteps = pipe.scheduler.timesteps
     max_id_int = int(timesteps.shape[0]) - 1
-    s_id_int = int(torch.randint(0, timesteps.shape[0], (1,)).item())
-    s_timestep = timesteps[s_id_int:s_id_int + 1].to(dtype=torch.float32, device=pipe.device)
-    noise_scale = inputs.get("noise_scale", 1.0)
+    num_train_timesteps = len(pipe.scheduler.alphas_cumprod)
+    min_step_percent = float(loss_inputs.get("dmd_min_step_percent", 0.02))
+    max_step_percent = float(loss_inputs.get("dmd_max_step_percent", 0.98))
+    if not 0.0 <= min_step_percent < max_step_percent <= 1.0:
+        raise ValueError("DMD timestep bounds require 0 <= dmd_min_step_percent < dmd_max_step_percent <= 1.")
+    min_timestep = max(0, min(int(min_step_percent * num_train_timesteps), num_train_timesteps - 1))
+    max_timestep = max(0, min(int(max_step_percent * num_train_timesteps), num_train_timesteps - 1))
+    if min_timestep >= max_timestep:
+        raise ValueError("DMD timestep bounds collapsed to an empty range.")
+    s_timestep_int = int(torch.randint(min_timestep, max_timestep + 1, (1,), device=pipe.device).item())
+    s_id_int = s_timestep_int
+    s_timestep = torch.tensor([s_timestep_int], dtype=torch.float32, device=pipe.device)
+    noise_scale = loss_inputs.get("noise_scale", 1.0)
+
+    cfg_scale = loss_inputs.get("cfg_scale", 1.0)
 
     def alpha_sigma(timestep):
         timestep_int = int(round(timestep.flatten()[0].detach().float().cpu().item()))
@@ -242,10 +266,17 @@ def StartDMDLossDDIM(pipe: BasePipeline, **inputs):
         sigma = torch.sqrt(torch.clamp(1.0 - alpha_prod, min=0.0))
         return alpha, sigma
 
-    def predict_model_output(role, role_inputs, timestep, progress_id):
-        return pipe.model_fn(
+    def predict_model_output(role, role_inputs, timestep, progress_id, cfg_scale):
+        role_attrs = getattr(pipe, "dmd_model_role_attrs", {})
+        lora_module = getattr(pipe, role_attrs[role], None) if role in role_attrs else None
+        return pipe.cfg_guided_model_fn(
+            pipe.model_fn,
+            cfg_scale,
+            role_inputs,
+            inputs_posi,
+            inputs_nega,
+            lora_module=lora_module,
             **pipe.get_iteration_models(role),
-            **role_inputs,
             timestep=timestep,
             progress_id=progress_id,
         )
@@ -266,8 +297,8 @@ def StartDMDLossDDIM(pipe: BasePipeline, **inputs):
         score = -eps_pred / sigma_safe
         return eps_pred, x0_pred, score
 
-    def predict_eps_x0_score(role, role_inputs, timestep, progress_id):
-        model_output = predict_model_output(role, role_inputs, timestep, progress_id)
+    def predict_eps_x0_score(role, role_inputs, timestep, progress_id, cfg_scale):
+        model_output = predict_model_output(role, role_inputs, timestep, progress_id, cfg_scale)
         return model_output_to_eps_x0_score(model_output, role_inputs["latents"], timestep)
 
     def training_target(clean_latents, noise, alpha, sigma):
@@ -280,15 +311,15 @@ def StartDMDLossDDIM(pipe: BasePipeline, **inputs):
             raise NotImplementedError(f"{prediction_type} is not implemented for StartDMDLossDDIM.")
 
     def consistency_sample():
-        generator_inputs = inputs.copy()
-        generator_inputs["latents"] = torch.randn_like(inputs["input_latents"]) * noise_scale
-        ids = torch.linspace(0, max_id_int, step_num).int()
-        id_num = ids.shape[0] - 1
+        generator_inputs = model_inputs_shared.copy()
+        generator_inputs["latents"] = torch.randn_like(loss_inputs["input_latents"]) * noise_scale
+        ids = torch.linspace(0, max_id_int, step_num + 1).int()
+        id_num = ids.shape[0] - 2
         stop_turn = torch.randint(0, id_num + 1, (1,)).item()
         for i, t_id in enumerate(ids):
             t_id_int = int(t_id.item())
             current_timestep = timesteps[t_id_int:t_id_int + 1].to(dtype=torch.float32, device=pipe.device)
-            _, x_g, _ = predict_eps_x0_score("generator", generator_inputs, current_timestep, t_id_int)
+            _, x_g, _ = predict_eps_x0_score("generator", generator_inputs, current_timestep, t_id_int, 1.0)
             if i == stop_turn:
                 generator_inputs["latents"] = x_g
                 return x_g
@@ -296,7 +327,7 @@ def StartDMDLossDDIM(pipe: BasePipeline, **inputs):
                 next_id_int = int(ids[i + 1].item())
                 next_timestep = timesteps[next_id_int:next_id_int + 1].to(dtype=torch.float32, device=pipe.device)
                 next_alpha, next_sigma = alpha_sigma(next_timestep)
-                generator_noise = torch.randn_like(inputs["input_latents"]) * noise_scale
+                generator_noise = torch.randn_like(loss_inputs["input_latents"]) * noise_scale
                 generator_inputs["latents"] = next_alpha * x_g + next_sigma * generator_noise
                 generator_inputs["latents"] = generator_inputs["latents"].detach()
         return generator_inputs["latents"]
@@ -310,29 +341,29 @@ def StartDMDLossDDIM(pipe: BasePipeline, **inputs):
         x_g = consistency_sample()
 
     s_alpha, s_sigma = alpha_sigma(s_timestep)
-    eps_endpoint = torch.randn_like(inputs["input_latents"]) * noise_scale
+    eps_endpoint = torch.randn_like(loss_inputs["input_latents"]) * noise_scale
 
     if dmd_update == "fake_score":
-        fake_inputs = inputs.copy()
+        fake_inputs = model_inputs_shared.copy()
         fake_inputs["latents"] = (s_alpha * x_g.detach() + s_sigma * eps_endpoint).detach()
         pipe.load_role_models_to_device("fake_score")
-        model_output = predict_model_output("fake_score", fake_inputs, s_timestep, s_id_int)
+        model_output = predict_model_output("fake_score", fake_inputs, s_timestep, s_id_int, 1.0)
         target = training_target(x_g.detach(), eps_endpoint, s_alpha, s_sigma)
         return torch.nn.functional.mse_loss(model_output.float(), target.detach().float())
 
     with torch.no_grad():
         x_s = s_alpha * x_g.detach() + s_sigma * eps_endpoint
-        fake_inputs = inputs.copy()
-        real_inputs = inputs.copy()
+        fake_inputs = model_inputs_shared.copy()
+        real_inputs = model_inputs_shared.copy()
         fake_inputs["latents"] = x_s
         real_inputs["latents"] = x_s
         pipe.load_role_models_to_device("real_score")
-        _, _, real_score = predict_eps_x0_score("real_score", real_inputs, s_timestep, s_id_int)
+        _, x_real, real_score = predict_eps_x0_score("real_score", real_inputs, s_timestep, s_id_int, cfg_scale)
         pipe.load_role_models_to_device("fake_score")
-        _, _, fake_score = predict_eps_x0_score("fake_score", fake_inputs, s_timestep, s_id_int)
-        reduce_dims = tuple(range(1, real_score.ndim))
-        weight = torch.abs(real_score).mean(dim=reduce_dims, keepdim=True).detach()
-        grad = (fake_score - real_score) / (weight + 1e-8)
+        _, x_fake, fake_score = predict_eps_x0_score("fake_score", fake_inputs, s_timestep, s_id_int, 1.0)
+        reduce_dims = tuple(range(1, x_real.ndim))
+        weight = torch.abs(x_real - x_g).mean(dim=reduce_dims, keepdim=True).detach()
+        grad = (x_fake - x_real) / (weight + 1e-8)
         grad = torch.nan_to_num(grad)
         target = (x_g - grad).detach()
     return 0.5 * torch.nn.functional.mse_loss(x_g.float(), target.float())

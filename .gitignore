@@ -13,6 +13,7 @@
 *.msc
 *.mv
 log*.txt
+image*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

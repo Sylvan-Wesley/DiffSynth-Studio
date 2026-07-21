@@ -125,9 +125,16 @@ class DMDModelLogger(ModelLogger):
     def export_role_state_dict(self, model, state_dict, role_prefix):
         trainable_param_names = model.trainable_param_names()
         role_state_dict = {
-            name[len(role_prefix):]: param
+            name: param
             for name, param in state_dict.items()
             if name in trainable_param_names and name.startswith(role_prefix)
+        }
+        if hasattr(model, "export_lora_alpha_state_dict"):
+            role_state_dict = model.export_lora_alpha_state_dict(role_state_dict)
+        role_state_dict = {
+            name[len(role_prefix):]: param
+            for name, param in role_state_dict.items()
+            if name.startswith(role_prefix)
         }
         return self.state_dict_converter(role_state_dict)
 

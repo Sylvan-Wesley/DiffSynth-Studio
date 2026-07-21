@@ -248,8 +248,8 @@ class StableDiffusionXLConsistencyPipeline(StableDiffusionXLPipeline):
 
         timesteps = self.scheduler.timesteps
         max_id_int = int(timesteps.shape[0]) - 1
-        ids = torch.linspace(0, max_id_int, steps=step_num, device=self.device).round().long()
-        stop_turn = ids.shape[0] - 1
+        ids = torch.linspace(0, max_id_int, steps=step_num + 1, device=self.device).round().long()
+        stop_turn = ids.shape[0] - 2
 
         for i, t_id in enumerate(progress_bar_cmd(ids)):
             t_id_int = int(t_id.item())
@@ -277,6 +277,7 @@ class StableDiffusionXLConsistencyPipeline(StableDiffusionXLPipeline):
             x_g = model_output_to_x0(noise_pred, inputs_shared["latents"], current_timestep)
             if i == stop_turn:
                 inputs_shared["latents"] = x_g
+                break
             else:
                 next_id_int = int(ids[i + 1].item())
                 next_timestep = timesteps[next_id_int:next_id_int + 1].to(dtype=torch.float32, device=self.device)

@@ -11,7 +11,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
         model_paths=None, model_id_with_origin_paths=None,
         tokenizer_path=None, tokenizer_2_path=None,
         trainable_models=None,
-        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_alpha=None, lora_checkpoint=None,
         dmd_generator_lora_checkpoint=None,
         dmd_fake_score_lora_checkpoint=None,
         dmd_real_score_lora_checkpoint=None,
@@ -23,6 +23,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
         offload_models=None,
         resume_from_checkpoint=None, remove_prefix_in_ckpt=None,
         prompt_only_height=1024, prompt_only_width=1024,
+        dmd_cfg_scale=1.0,
         device="cpu",
         task="sft",
     ):
@@ -34,6 +35,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
         self.pipe = StableDiffusionXLPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, tokenizer_2_config=tokenizer_2_config)
         self.prompt_only_height = prompt_only_height or 1024
         self.prompt_only_width = prompt_only_width or 1024
+        self.dmd_cfg_scale = dmd_cfg_scale
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
 
@@ -43,6 +45,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
                 self.pipe,
                 lora_target_modules=lora_target_modules,
                 lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
                 generator_lora_checkpoint=dmd_generator_lora_checkpoint,
                 fake_score_lora_checkpoint=dmd_fake_score_lora_checkpoint,
                 real_score_lora_checkpoint=dmd_real_score_lora_checkpoint,
@@ -53,6 +56,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
                 self.pipe, trainable_models,
                 lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
                 preset_lora_path, preset_lora_model,
+                lora_alpha=lora_alpha,
                 task=task,
             )
         
@@ -73,7 +77,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
             # Prefer running sft:data_process first; this alias is equivalent.
             "dmd:data_process": lambda pipe, *args: args,
             "dmd:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega, dmd_update, tau, dmd_step: StartDMDLossDDIM(
-                pipe, **inputs_shared, **inputs_posi, dmd_update=dmd_update, tau=tau, step_num=dmd_step
+                pipe, inputs_shared, inputs_posi, inputs_nega, dmd_update=dmd_update, tau=tau, step_num=dmd_step
             ),
             "meanflow:data_process": lambda pipe, *args: args,
         }
@@ -95,7 +99,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
             image = image[0]
 
         inputs_posi = {"prompt": data["prompt"]}
-        inputs_nega = {"negative_prompt": ""}
+        inputs_nega = {"prompt": data.get("negative_prompt", "")}
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
@@ -104,7 +108,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
             "width": image.size[0],
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
-            "cfg_scale": 1,
+            "cfg_scale": self.dmd_cfg_scale,
             "rand_device": self.pipe.device,
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
@@ -123,14 +127,7 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
 
         prompt_embedder = SDXLUnit_PromptEmbedder()
         add_time_ids_computer = SDXLUnit_AddTimeIdsComputer()
-        with torch.no_grad():
-            inputs_posi = prompt_embedder.process(self.pipe, prompt)
-            inputs_shared = add_time_ids_computer.process(self.pipe, height, width)
-        inputs_nega = {}
-        if inputs_shared["add_time_ids"].shape[0] == 1 and batch_size > 1:
-            inputs_shared["add_time_ids"] = inputs_shared["add_time_ids"].repeat_interleave(batch_size, dim=0)
-
-        inputs_shared.update({
+        inputs_shared = {
             "input_latents": torch.zeros(
                 (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
                 dtype=self.pipe.torch_dtype,
@@ -138,13 +135,30 @@ class StableDiffusionXLTrainingModule(DiffusionTrainingModule):
             ),
             "height": height,
             "width": width,
-            "cfg_scale": 1,
+            "cfg_scale": self.dmd_cfg_scale,
             "rand_device": self.pipe.device,
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
             "_skip_pipeline_units": True,
-        })
+        }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+
+        negative_prompt = data.get("negative_prompt", "")
+        if isinstance(prompt, list) and isinstance(negative_prompt, str):
+            negative_prompt = [negative_prompt] * batch_size
+        elif isinstance(prompt, list) and isinstance(negative_prompt, tuple):
+            negative_prompt = list(negative_prompt)
+        if isinstance(negative_prompt, list) and len(negative_prompt) == 1 and batch_size > 1:
+            negative_prompt = negative_prompt * batch_size
+        if isinstance(negative_prompt, list) and len(negative_prompt) != batch_size:
+            raise ValueError("Prompt-only SDXL DMD `negative_prompt` must be a string or match the prompt batch size.")
+
+        with torch.no_grad():
+            inputs_posi = prompt_embedder.process(self.pipe, prompt)
+            inputs_nega = prompt_embedder.process(self.pipe, negative_prompt) if inputs_shared["cfg_scale"] != 1 else {}
+            inputs_shared.update(add_time_ids_computer.process(self.pipe, height, width))
+        if inputs_shared["add_time_ids"].shape[0] == 1 and batch_size > 1:
+            inputs_shared["add_time_ids"] = inputs_shared["add_time_ids"].repeat_interleave(batch_size, dim=0)
         return inputs_shared, inputs_posi, inputs_nega
     
     def forward(self, data, inputs=None, generator_loss=0, fake_loss=0, dmd_update=None, tau=None, dmd_step=4):
@@ -204,6 +218,7 @@ if __name__ == "__main__":
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,
         lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         lora_checkpoint=args.lora_checkpoint,
         dmd_generator_lora_checkpoint=args.dmd_generator_lora_checkpoint,
         dmd_fake_score_lora_checkpoint=args.dmd_fake_score_lora_checkpoint,
@@ -219,6 +234,7 @@ if __name__ == "__main__":
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         prompt_only_height=args.height or 1024,
         prompt_only_width=args.width or 1024,
+        dmd_cfg_scale=args.dmd_cfg_scale,
         task=args.task,
         device="cpu" if args.enable_model_cpu_offload else accelerator.device,
     )
