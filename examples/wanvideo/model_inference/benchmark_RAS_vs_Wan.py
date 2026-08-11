@@ -18,17 +18,9 @@ Controls:
     - seed:               Random seed
 """
 
-import os
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
 import time
 import torch
 import numpy as np
-
-# Verify memory allocator configuration
-_alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF", "(not set)")
-print(f"PYTORCH_ALLOC_CONF: {_alloc_conf}")
-
 from tqdm import tqdm
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig

@@ -21,26 +21,14 @@ Controls:
     - enable_viz: Store selection masks for visualization
 """
 
-import os
-# Use expandable CUDA memory segments to reduce allocator fragmentation.
-# Required: PyTorch 2.5+, CUDA 11.2+ (A100 supports CUDA virtual address management).
-# Must be set before any CUDA operations, including any indirect import of torch.
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
 import torch
 import numpy as np
-
-# Verify memory allocator configuration
-_alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF", "(not set)")
-print(f"  PYTORCH_ALLOC_CONF: {_alloc_conf}")
-if hasattr(torch.cuda, "memory") and hasattr(torch.cuda.memory, "CUDAPluggableAllocator"):
-    print(f"  CUDA allocator: pluggable")
-
 from PIL import Image
 from tqdm import tqdm
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.models.wan_video_dit import selection_mask_to_grid, set_to_torch_norm
+from diffsynth.models.wan_video_dit import FLASH_ATTN_3_AVAILABLE, FLASH_ATTN_2_AVAILABLE, SAGE_ATTN_AVAILABLE
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -102,6 +90,7 @@ print(f"  Patch size: {dit.patch_size}")
 # This replaces the custom x.float() path with a memory-efficient fused CUDA kernel.
 set_to_torch_norm([dit])
 print("  RMSNorm: torch_norm enabled")
+print(f"  Attention: FA3={FLASH_ATTN_3_AVAILABLE}, FA2={FLASH_ATTN_2_AVAILABLE}, Sage={SAGE_ATTN_AVAILABLE}")
 
 
 # ═══════════════════════════════════════════════════════════════
