@@ -63,6 +63,51 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     return x
 
 
+def gather_tokens(x: torch.Tensor, indices: torch.Tensor):
+    # x: [B, S, D]
+    # indices: [B, N]
+    gather_indices = indices.unsqueeze(-1).expand(
+        -1, -1, x.shape[-1]
+    )
+    return torch.gather(x, dim=1, index=gather_indices)
+
+
+def scatter_tokens_(
+    destination: torch.Tensor,
+    indices: torch.Tensor,
+    source: torch.Tensor,
+):
+    # destination: [B, S, D]
+    # source: [B, N, D]
+    scatter_indices = indices.unsqueeze(-1).expand(
+        -1, -1, destination.shape[-1]
+    )
+    destination.scatter_(1, scatter_indices, source)
+
+def cache_ready(cache, *keys):
+    return (
+        cache is not None
+        and all(cache.get(key) is not None for key in keys)
+    )
+
+
+def selection_mask_to_grid(mask: torch.Tensor, grid_size: tuple) -> torch.Tensor:
+    """Convert a [B, f*h*w] bool selection mask to a [B, 1, f, h, w] float grid.
+
+    Useful for upsampling and overlaying as a heatmap on generated frames to
+    visualize which spatial regions RAS selected at each timestep.
+
+    Args:
+        mask: Boolean tensor of shape [B, f*h*w], True where a patch was selected.
+        grid_size: Tuple (f, h, w) — the spatial grid dimensions (frames, height, width in patches).
+
+    Returns:
+        Float tensor of shape [B, 1, f, h, w] with 1.0 at selected positions, 0.0 elsewhere.
+    """
+    f, h, w = grid_size
+    return mask.float().reshape(-1, 1, f, h, w)
+
+
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return (x * (1 + scale) + shift)
 
@@ -91,11 +136,16 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
-def rope_apply(x, freqs, num_heads):
+def rope_apply(x, freqs, num_heads, selected_patches=None):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
     freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
+    if selected_patches is not None:
+        # freqs: [S_full, 1, D/2]
+        # indices: [B, S_active]
+        # result: [B, S_active, 1, D/2]
+        freqs = freqs[selected_patches]
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
     return x_out.to(x.dtype)
 
@@ -152,12 +202,33 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
+    def forward(self, x, freqs, kv_cache=None, selected_patches=None):
+        # The size of selected_patches should be [B, N_active]
+        if selected_patches is not None and cache_ready(kv_cache, "k", "v"):
+            k = kv_cache["k"]
+            v = kv_cache["v"]
+
+            q = self.norm_q(self.q(x))
+            q = rope_apply(q, freqs, self.num_heads, selected_patches)
+
+            k_active = self.norm_k(self.k(x))
+            v_active = self.v(x)
+            k_active = rope_apply(k_active, freqs, self.num_heads, selected_patches)
+
+            scatter_tokens_(k, selected_patches, k_active)
+            scatter_tokens_(v, selected_patches, v_active)
+
+        else: 
+            q = self.norm_q(self.q(x))
+            k = self.norm_k(self.k(x))
+            v = self.v(x)
+            q = rope_apply(q, freqs, self.num_heads)
+            k = rope_apply(k, freqs, self.num_heads)
+
+        if kv_cache is not None:
+            kv_cache["k"] = k
+            kv_cache["v"] = v
+        
         x = self.attn(q, k, v)
         return self.o(x)
 
@@ -183,12 +254,28 @@ class CrossAttention(nn.Module):
             
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, ctx_kv_cache=None, selected_patches=None):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
         else:
             ctx = y
+
+        if (selected_patches is not None and cache_ready(ctx_kv_cache, "k", "v")):  
+            q = self.norm_q(self.q(x))
+            k = ctx_kv_cache["k"]
+            v = ctx_kv_cache["v"]
+            x = self.attn(q, k, v)
+            if self.has_image_input:
+                assert ctx_kv_cache.get("k_img", 0) != 0, "ValueError: KV Cache K for input image must be computed when having image input!"
+                assert ctx_kv_cache.get("v_img", 0) != 0, "ValueError: KV Cache V for input image must be computed when having image input!" 
+                k_img = ctx_kv_cache["k_img"] 
+                v_img = ctx_kv_cache["v_img"]
+                y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
+                x = x + y
+                
+            return self.o(x)
+
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(ctx))
         v = self.v(ctx)
@@ -198,6 +285,13 @@ class CrossAttention(nn.Module):
             v_img = self.v_img(img)
             y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y
+
+        if ctx_kv_cache is not None:
+            ctx_kv_cache["k"] = k
+            ctx_kv_cache["v"] = v
+            ctx_kv_cache["k_img"] = k_img
+            ctx_kv_cache["v_img"] = v_img
+
         return self.o(x)
 
 
@@ -226,7 +320,8 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+
+    def forward(self, x, context, t_mod, freqs, kv_cache=None, ctx_kv_cache=None, selected_patches=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -238,8 +333,8 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, kv_cache, selected_patches))
+        x = x + self.cross_attn(self.norm3(x), context, ctx_kv_cache, selected_patches)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -417,6 +512,13 @@ class WanModel(torch.nn.Module):
         else:
             self.control_adapter = None
 
+        # RAS: previous step's predicted noise in token space [B, S, out_dim * prod(patch_size)]
+        # Used by select_region to compute per-token std dev for variance-based selection
+        self._prev_noise_tokens = None
+
+        # RAS debug: stores (timestep, mask [B, S], grid_size (f, h, w)) per RAS step
+        self.debug_masks = []
+
         self.prepare_wantodance(in_dim, dim, num_heads, has_image_pos_emb, out_dim, patch_size, eps,
                                 wantodance_enable_music_inject, wantodance_music_inject_layers, wantodance_enable_refimage, wantodance_enable_refface,
                                 wantodance_enable_global, wantodance_enable_dynamicfps, wantodance_enable_unimodel)
@@ -494,11 +596,16 @@ class WanModel(torch.nn.Module):
             x = self.patch_embedding_global(x)
         else:
             x = self.patch_embedding(x)
+        f, h, w = x.shape[2:]
         if self.control_adapter is not None and control_camera_latents_input is not None:
             y_camera = self.control_adapter(control_camera_latents_input)
             x = [u + v for u, v in zip(x, y_camera)]
             x = x[0].unsqueeze(0)
-        return x
+        x = rearrange(
+            x,
+            "b d f h w -> b (f h w) d",
+        )
+        return x, (f, h, w)
 
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
         return rearrange(
@@ -507,35 +614,140 @@ class WanModel(torch.nn.Module):
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
 
+    def select_region(self,
+                x: torch.Tensor,
+                ratio: float,
+                timestep: torch.Tensor,
+                context: torch.Tensor,
+                skip_list: torch.Tensor,
+                skip_k: torch.Tensor,
+                clip_feature: Optional[torch.Tensor] = None,
+                y: Optional[torch.Tensor] = None,
+                use_heuristics: bool = True,
+                k_starvation: float = 0.5,
+                **kwargs,
+                ):
+
+        # Return a selected_patches object \in [B, N_active]
+        #
+        # Region selection follows Liu et al. CVPR 2026:
+        #   importance = 1 / (std(prev_noise) + eps)
+        #   score = importance * exp(k * drop_count)
+        # Higher score = more likely to be selected (top-k).
+        #
+        # - prev_noise: token-level predicted noise from the PREVIOUS step.
+        #   Low within-token variance → semantically meaningful region → select.
+        # - drop_count (skip_k): per-token counter of how many steps it was skipped.
+        #   exp(k * drop_count) boosts long-skipped tokens to prevent starvation.
+        # - Falls back to L2 norm of current latents on the first step (no prev noise).
+
+        N = x.shape[1]
+        if use_heuristics:
+            prev_noise = self._prev_noise_tokens
+            if prev_noise is not None:
+                # Paper metric: std of predicted noise across the token dimension.
+                # Lower std → model is more confident → region is semantically meaningful.
+                std_noise = prev_noise.std(dim=-1)  # [B, S]
+                importance = 1.0 / (std_noise + 1e-6)
+            else:
+                # First step: no previous noise available, use L2 norm of latents.
+                importance = (x ** 2).sum(dim=-1)
+
+            # Starvation prevention: boost tokens that have been skipped many times.
+            # skip_k stores the per-token drop count (incremented each step,
+            # reset for selected tokens).
+            score = importance * torch.exp(k_starvation * skip_k)
+            selected_patches = score.topk(min(N, math.ceil(N * ratio)), dim=-1).indices
+            return selected_patches
+        else:
+            raise NotImplementedError
+
+    def update_skip_record(self,
+            skip_list: torch.Tensor,
+            skip_k: torch.Tensor,
+            selected_patches: torch.Tensor,
+        ):
+        """Update per-token drop counters for starvation prevention.
+
+        skip_k: per-token drop count [B, S]. Selected tokens reset to 0;
+                all tokens increment by 1 (unselected accumulate, selected → 1).
+        """
+        B = skip_k.shape[0]
+        # Reset drop count for selected tokens
+        skip_k[torch.arange(0, B, device=skip_k.device), selected_patches] = 0
+        # Increment all: unselected accumulate, selected go to 1
+        skip_k.add_(1)
+
+    def get_selection_masks(self):
+        """Return list of (timestep, binary_mask [B, S], grid_size (f, h, w)) for each RAS step.
+
+        Call after inference to retrieve per-step region selection masks for visualization.
+        """
+        return self.debug_masks
+
+    def clear_selection_masks(self):
+        """Clear stored selection masks to free memory."""
+        self.debug_masks = []
+
     def forward(self,
                 x: torch.Tensor,
                 timestep: torch.Tensor,
                 context: torch.Tensor,
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
+                skip_list: torch.Tensor = None,
+                skip_k: torch.Tensor = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                kv_cache: list = None,
+                ctx_kv_cache: list = None,
+                selected_patches: torch.Tensor = None,
+                ratio: float = 0.25,
+                enable_debug_masks: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
-        
+
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
-        
+
         x, (f, h, w) = self.patchify(x)
-        
+
         freqs = torch.cat([
             self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-        for block in self.blocks:
+        # RAS: region selection with KV-cache support
+        if kv_cache is not None:
+            x_dumb = x.clone()  # saved for dumb (head-only) update of inactive tokens
+            # Use externally-provided selected_patches if given, otherwise compute internally
+            if selected_patches is not None:
+                region_selected = selected_patches
+            else:
+                region_selected = self.select_region(x, ratio, timestep, context, skip_list, skip_k, clip_feature,
+                                                      y, **kwargs)
+                self.update_skip_record(skip_list, skip_k, region_selected)
+            x_active = gather_tokens(x, region_selected)
+
+            # Store selection mask for visualization if debug mode is enabled
+            if enable_debug_masks:
+                mask = torch.zeros(x.shape[0], x.shape[1], device=x.device, dtype=torch.bool)
+                mask.scatter_(1, region_selected, True)
+                t_val = int(timestep.item()) if isinstance(timestep, torch.Tensor) else timestep
+                self.debug_masks.append((t_val, mask, (f, h, w)))
+        else:
+            x_active = x
+            region_selected = None
+
+        # DiT block processing
+        for i, block in enumerate(self.blocks):
             if self.training:
                 x = gradient_checkpoint_forward(
                     block,
@@ -544,8 +756,26 @@ class WanModel(torch.nn.Module):
                     x, context, t_mod, freqs
                 )
             else:
-                x = block(x, context, t_mod, freqs)
+                blk_kv_cache = kv_cache[i] if kv_cache is not None else None
+                blk_ctx_kv = ctx_kv_cache[i] if ctx_kv_cache is not None else None
+                x_active = block(x_active, context, t_mod, freqs, blk_kv_cache, blk_ctx_kv, region_selected)
 
-        x = self.head(x, t)
-        x = self.unpatchify(x, (f, h, w))
+        # Head projection and output
+        if self.training:
+            x = self.head(x, t)
+            x = self.unpatchify(x, (f, h, w))
+        elif kv_cache is not None:
+            # RAS eval: active tokens get full DiT + head; inactive tokens get dumb head-only update
+            x_active = self.head(x_active, t)
+            x_dumb = self.head(x_dumb, t)
+            scatter_tokens_(x_dumb, region_selected, x_active)
+            # Store token-level noise for next step's variance-based region selection
+            self._prev_noise_tokens = x_dumb.detach()
+            x = self.unpatchify(x_dumb, (f, h, w))
+        else:
+            # Full eval (no RAS): all tokens processed through DiT
+            x = self.head(x_active, t)
+            # Store token-level noise for next step's variance-based region selection
+            self._prev_noise_tokens = x.detach()
+            x = self.unpatchify(x, (f, h, w))
         return x
