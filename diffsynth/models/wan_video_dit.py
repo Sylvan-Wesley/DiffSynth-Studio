@@ -789,8 +789,11 @@ class WanModel(torch.nn.Module):
                 # Dense fast-path: all tokens selected, skip clone and gather.
                 x_active = x
             else:
-                x_dumb = x.clone()  # retained for dumb head-only update of inactive tokens
                 x_active = gather_tokens(x, region_selected)
+                # Retain a copy of the DiT input only for the fallback dumb update
+                # (head on raw input) used when no prior prediction exists yet.
+                if self._prev_noise_tokens is None:
+                    x_dumb = x.clone()
 
             # Store selection mask for visualization if debug mode is enabled
             if enable_debug_masks:
@@ -821,14 +824,23 @@ class WanModel(torch.nn.Module):
             x = self.head(x, t)
             x = self.unpatchify(x, (f, h, w))
         elif kv_cache is not None:
-            # RAS eval: active tokens get full DiT + head; inactive tokens get dumb head-only update
+            # RAS eval: active tokens get full DiT + head; inactive tokens get a dumb update.
             x_active = self.head(x_active, t)
             if is_full:
-                # Dense step: all tokens processed through DiT, no dumb head needed
+                # Dense step: all tokens processed through DiT, no dumb update needed
                 self._prev_noise_tokens = x_active.detach()
                 x = self.unpatchify(x_active, (f, h, w))
             else:
-                x_dumb = self.head(x_dumb, t)
+                # Dumb update: carry forward the last real prediction for inactive tokens
+                # instead of feeding raw DiT input to head(). head() is trained on the
+                # output of the DiT block stack, so applying it to unprocessed input
+                # tokens yields garbage noise predictions that corrupt inactive regions
+                # on every step. `_prev_noise_tokens` is seeded by the dense warm-up steps.
+                if self._prev_noise_tokens is not None:
+                    x_dumb = self._prev_noise_tokens.clone()
+                else:
+                    # Fallback (e.g. no dense warm-up): head on raw DiT input.
+                    x_dumb = self.head(x_dumb, t)
                 scatter_tokens_(x_dumb, region_selected, x_active)
                 # Store token-level noise for next step's variance-based region selection
                 self._prev_noise_tokens = x_dumb.detach()
