@@ -200,11 +200,14 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        dtype = x.dtype
         if self.use_torch_norm:
             return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
-        else:        
-            return self.norm(x.float()).to(dtype) * self.weight
+        else:
+            # Compute RMS in the input dtype to avoid allocating a full
+            # float32 copy of x (saves ~50% peak memory per call).
+            # PyTorch reductions accumulate in float32 internally without
+            # materializing a full intermediate tensor.
+            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
 
 
 class AttentionModule(nn.Module):

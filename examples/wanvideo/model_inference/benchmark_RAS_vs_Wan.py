@@ -24,9 +24,15 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 import time
 import torch
 import numpy as np
+
+# Verify memory allocator configuration
+_alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF", "(not set)")
+print(f"PYTORCH_ALLOC_CONF: {_alloc_conf}")
+
 from tqdm import tqdm
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
+from diffsynth.models.wan_video_dit import set_to_torch_norm
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -79,6 +85,10 @@ device = pipe.device
 dtype = pipe.torch_dtype
 
 print(f"  DiT blocks: {len(dit.blocks)}, dim: {dit.dim}, patch_size: {dit.patch_size}")
+
+# Use PyTorch's fused RMSNorm kernel to avoid float32 temporaries.
+set_to_torch_norm([dit])
+print("  RMSNorm: torch_norm enabled")
 
 
 def encode_prompt(pipe, prompt: str) -> torch.Tensor:
