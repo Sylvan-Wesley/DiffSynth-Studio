@@ -99,7 +99,8 @@ latent_frames = (num_frames - 1) // 4 + 1
 latent_h = height // vae.upsampling_factor
 latent_w = width // vae.upsampling_factor
 shape = (1, z_dim, latent_frames, latent_h, latent_w)
-S = latent_frames * latent_h * latent_w   # total tokens
+# Patchify reduces spatial dims by patch_size[1:] — S is tokens AFTER patchify.
+S = latent_frames * (latent_h // dit.patch_size[1]) * (latent_w // dit.patch_size[2])
 B = 1
 num_layers = len(dit.blocks)
 
@@ -107,6 +108,25 @@ num_layers = len(dit.blocks)
 scheduler.set_timesteps(num_inference_steps, denoising_strength=1.0, shift=5.0)
 timesteps = scheduler.timesteps
 print(f"  Timesteps: {len(timesteps)} steps")
+
+# Offload unused models to CPU to free GPU memory for KV caches
+for model_attr, name in [
+    (pipe.text_encoder, "text_encoder"),
+    (pipe.vae, "vae"),
+    (getattr(pipe, "image_encoder", None), "image_encoder"),
+    (getattr(pipe, "motion_controller", None), "motion_controller"),
+]:
+    if model_attr is not None:
+        model_attr.to("cpu")
+        print(f"  Moved {name} to CPU")
+
+torch.cuda.empty_cache()
+torch.cuda.synchronize()
+
+if torch.cuda.is_available():
+    free, total = torch.cuda.mem_get_info()
+    used_gb = (total - free) / (1024**3)
+    print(f"  GPU memory in use before denoising: {used_gb:.1f} GiB / {total/(1024**3):.1f} GiB")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -126,6 +146,9 @@ def denoise_step(latents, t, kv_cache_posi, ctx_kv_cache_posi,
         selected_patches=selected_patches,
         ratio=ratio_val, enable_debug_masks=False,
     )
+
+    # Free transient posi activations before nega forward
+    torch.cuda.empty_cache()
 
     # CFG
     if cfg_scale != 1.0:

@@ -138,7 +138,9 @@ print(f"  Timesteps: {len(scheduler.timesteps)} steps, "
 # ═══════════════════════════════════════════════════════════════
 
 num_layers = len(dit.blocks)
-S = latent_frames * latent_h * latent_w   # total spatial-temporal tokens
+# Patchify reduces spatial dims by patch_size[1:] (e.g. (2,2) → h/2, w/2 patches).
+# S must be the number of tokens AFTER patchify, not the VAE latent dims.
+S = latent_frames * (latent_h // dit.patch_size[1]) * (latent_w // dit.patch_size[2])
 B = latents.shape[0]
 
 # Per-layer KV caches for self-attention and cross-attention
@@ -158,10 +160,36 @@ dit._prev_noise_tokens = None
 # Pre-compute all-patches index for dense warm-up steps
 all_patches = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-print(f"  Total tokens per frame: {S}  (={latent_frames}×{latent_h}×{latent_w})")
+print(f"  Total tokens: {S}  (={latent_frames}×{latent_h//dit.patch_size[1]}×{latent_w//dit.patch_size[2]} patches)")
 print(f"  Active tokens (ratio={ratio}): {int(S * ratio)}")
 print(f"  Dense warm-up steps: {num_dense_steps}")
 print(f"  Expected speedup: ~{1/ratio:.1f}x (after warm-up)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Free GPU memory: offload models not needed during denoising
+# ═══════════════════════════════════════════════════════════════
+
+# After encoding, T5 text encoder is no longer needed on GPU.
+# VAE is only needed for final decoding. Move both to CPU.
+for model_attr, name in [
+    (pipe.text_encoder, "text_encoder"),
+    (pipe.vae, "vae"),
+    (getattr(pipe, "image_encoder", None), "image_encoder"),
+    (getattr(pipe, "motion_controller", None), "motion_controller"),
+]:
+    if model_attr is not None:
+        model_attr.to("cpu")
+        print(f"  Moved {name} to CPU")
+
+torch.cuda.empty_cache()
+torch.cuda.synchronize()
+
+# Report available GPU memory
+if torch.cuda.is_available():
+    free, total = torch.cuda.mem_get_info()
+    used_gb = (total - free) / (1024**3)
+    print(f"  GPU memory in use before denoising: {used_gb:.1f} GiB / {total/(1024**3):.1f} GiB")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -194,6 +222,11 @@ for progress_id, timestep in enumerate(tqdm(scheduler.timesteps)):
         ratio=ratio,
         enable_debug_masks=enable_viz,
     )
+
+    # Free transient memory from posi forward before running nega forward.
+    # The posi KV cache must persist for the next step, but intermediate
+    # activations from the posi forward can be released.
+    torch.cuda.empty_cache()
 
     # --- Classifier-free guidance ---
     if cfg_scale != 1.0:

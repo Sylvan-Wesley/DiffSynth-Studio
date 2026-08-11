@@ -289,8 +289,9 @@ class CrossAttention(nn.Module):
         if ctx_kv_cache is not None:
             ctx_kv_cache["k"] = k
             ctx_kv_cache["v"] = v
-            ctx_kv_cache["k_img"] = k_img
-            ctx_kv_cache["v_img"] = v_img
+            if self.has_image_input:
+                ctx_kv_cache["k_img"] = k_img
+                ctx_kv_cache["v_img"] = v_img
 
         return self.o(x)
 
@@ -734,6 +735,21 @@ class WanModel(torch.nn.Module):
                 region_selected = self.select_region(x, ratio, timestep, context, skip_list, skip_k, clip_feature,
                                                       y, **kwargs)
                 self.update_skip_record(skip_list, skip_k, region_selected)
+
+            # Safety: validate that selected indices are within the token sequence bounds.
+            # A common mistake is computing S from VAE latent dims instead of patched dims.
+            max_idx = region_selected.max().item()
+            num_tokens = x.shape[1]
+            if max_idx >= num_tokens:
+                raise IndexError(
+                    f"RAS selected_patches index {max_idx} is out of bounds for "
+                    f"token dimension {num_tokens}. This usually means S (total tokens) "
+                    f"was computed from VAE latent spatial dims "
+                    f"({x.shape[1] * self.patch_size[1] * self.patch_size[2]} elements) "
+                    f"instead of patched dims ({num_tokens} elements). "
+                    f"Fix: S = f * (h // patch_size[1]) * (w // patch_size[2])"
+                )
+
             x_active = gather_tokens(x, region_selected)
 
             # Store selection mask for visualization if debug mode is enabled
