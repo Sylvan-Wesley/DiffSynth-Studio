@@ -21,6 +21,12 @@ Controls:
     - enable_viz: Store selection masks for visualization
 """
 
+import os
+# Use expandable CUDA memory segments to reduce allocator fragmentation.
+# Required: PyTorch 2.5+, CUDA 11.2+ (A100 supports CUDA virtual address management).
+# Must be set before any CUDA operations.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import numpy as np
 from PIL import Image

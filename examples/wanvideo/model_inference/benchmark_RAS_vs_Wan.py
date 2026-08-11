@@ -18,6 +18,9 @@ Controls:
     - seed:               Random seed
 """
 
+import os
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import time
 import torch
 import numpy as np

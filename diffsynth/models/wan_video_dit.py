@@ -137,17 +137,48 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def rope_apply(x, freqs, num_heads, selected_patches=None):
+    """Apply rotary position embeddings using real-valued bf16 math.
+
+    Decomposes the complex rotation (a+ib)(c+is) = (ac-bs) + i(as+bc)
+    to operate entirely in the input dtype, avoiding float64 temporaries.
+
+    Args:
+        x: [B, S, dim] in bf16 or fp16.
+        freqs: complex tensor [S, 1, D/2] where D = head_dim.
+               cos/sin are extracted via .real and .imag.
+        num_heads: number of attention heads.
+        selected_patches: optional [B, S_active] indices into freqs.
+    Returns:
+        [B, S, dim] rotated tensor in the input dtype.
+    """
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(
-        x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
+    dtype = x.dtype
+
     if selected_patches is not None:
-        # freqs: [S_full, 1, D/2]
-        # indices: [B, S_active]
-        # result: [B, S_active, 1, D/2]
         freqs = freqs[selected_patches]
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
+
+    # Extract cos/sin from complex frequencies in the input dtype.
+    # freqs is complex64 (complex32 on NPU); .real/.imag are float32 views.
+    cos = freqs.real.to(dtype)  # [S, 1, D/2] or [B, S_active, 1, D/2]
+    sin = freqs.imag.to(dtype)
+
+    # Split interleaved (real, imag) pairs along the head dim.
+    # unflatten(-1, (-1, 2)): [..., D] -> [..., D/2, 2]
+    #   dim 0 of the pair = even-indexed (real part)
+    #   dim 1 of the pair = odd-indexed  (imag part)
+    x_paired = x.unflatten(-1, (-1, 2))
+    x_real = x_paired[..., 0]  # [B, S, N, D/2]
+    x_imag = x_paired[..., 1]  # [B, S, N, D/2]
+
+    # Real-valued complex rotation:
+    #   (x_real + i*x_imag) * (cos + i*sin)
+    # = (x_real*cos - x_imag*sin) + i*(x_real*sin + x_imag*cos)
+    out_real = x_real * cos - x_imag * sin
+    out_imag = x_real * sin + x_imag * cos
+
+    # Re-interleave: stack into [B, S, N, D/2, 2] then flatten.
+    x_out = torch.stack([out_real, out_imag], dim=-1)
+    return x_out.flatten(start_dim=2)
 
 
 def set_to_torch_norm(models):
@@ -727,14 +758,15 @@ class WanModel(torch.nn.Module):
 
         # RAS: region selection with KV-cache support
         if kv_cache is not None:
-            x_dumb = x.clone()  # saved for dumb (head-only) update of inactive tokens
-            # Use externally-provided selected_patches if given, otherwise compute internally
+            # Determine whether this is a dense step (all tokens selected)
             if selected_patches is not None:
                 region_selected = selected_patches
+                is_full = region_selected.shape[1] == x.shape[1]
             else:
                 region_selected = self.select_region(x, ratio, timestep, context, skip_list, skip_k, clip_feature,
                                                       y, **kwargs)
                 self.update_skip_record(skip_list, skip_k, region_selected)
+                is_full = False
 
             # Safety: validate that selected indices are within the token sequence bounds.
             # A common mistake is computing S from VAE latent dims instead of patched dims.
@@ -750,7 +782,12 @@ class WanModel(torch.nn.Module):
                     f"Fix: S = f * (h // patch_size[1]) * (w // patch_size[2])"
                 )
 
-            x_active = gather_tokens(x, region_selected)
+            if is_full:
+                # Dense fast-path: all tokens selected, skip clone and gather.
+                x_active = x
+            else:
+                x_dumb = x.clone()  # retained for dumb head-only update of inactive tokens
+                x_active = gather_tokens(x, region_selected)
 
             # Store selection mask for visualization if debug mode is enabled
             if enable_debug_masks:
@@ -783,11 +820,16 @@ class WanModel(torch.nn.Module):
         elif kv_cache is not None:
             # RAS eval: active tokens get full DiT + head; inactive tokens get dumb head-only update
             x_active = self.head(x_active, t)
-            x_dumb = self.head(x_dumb, t)
-            scatter_tokens_(x_dumb, region_selected, x_active)
-            # Store token-level noise for next step's variance-based region selection
-            self._prev_noise_tokens = x_dumb.detach()
-            x = self.unpatchify(x_dumb, (f, h, w))
+            if is_full:
+                # Dense step: all tokens processed through DiT, no dumb head needed
+                self._prev_noise_tokens = x_active.detach()
+                x = self.unpatchify(x_active, (f, h, w))
+            else:
+                x_dumb = self.head(x_dumb, t)
+                scatter_tokens_(x_dumb, region_selected, x_active)
+                # Store token-level noise for next step's variance-based region selection
+                self._prev_noise_tokens = x_dumb.detach()
+                x = self.unpatchify(x_dumb, (f, h, w))
         else:
             # Full eval (no RAS): all tokens processed through DiT
             x = self.head(x_active, t)

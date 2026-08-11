@@ -47,19 +47,35 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
     
 def rope_apply(x, freqs, num_heads):
-    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    s_per_rank = x.shape[1]
+    """Apply rotary position embeddings with sequence-parallel rank slicing.
 
-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(
-        x.shape[0], x.shape[1], x.shape[2], -1, 2))
+    Uses real-valued bf16 math to avoid float64 temporaries.
+    Decomposes complex rotation (a+ib)(c+is) = (ac-bs) + i(as+bc).
+    """
+    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    dtype = x.dtype
+    s_per_rank = x.shape[1]
 
     sp_size = get_sequence_parallel_world_size()
     sp_rank = get_sequence_parallel_rank()
     freqs = pad_freqs(freqs, s_per_rank * sp_size)
     freqs_rank = freqs[(sp_rank * s_per_rank):((sp_rank + 1) * s_per_rank), :, :]
-    freqs_rank = freqs_rank.to(torch.complex64) if freqs_rank.device.type == "npu" else freqs_rank
-    x_out = torch.view_as_real(x_out * freqs_rank).flatten(2)
-    return x_out.to(x.dtype)
+
+    # Extract cos/sin from complex frequencies in the input dtype.
+    cos = freqs_rank.real.to(dtype)  # [S_rank, 1, D/2]
+    sin = freqs_rank.imag.to(dtype)
+
+    # Split interleaved (real, imag) pairs along the head dim.
+    x_paired = x.unflatten(-1, (-1, 2))
+    x_real = x_paired[..., 0]  # [B, S, N, D/2]
+    x_imag = x_paired[..., 1]  # [B, S, N, D/2]
+
+    # Real-valued complex rotation.
+    out_real = x_real * cos - x_imag * sin
+    out_imag = x_real * sin + x_imag * cos
+
+    x_out = torch.stack([out_real, out_imag], dim=-1)
+    return x_out.flatten(start_dim=2)
 
 def usp_dit_forward(self,
             x: torch.Tensor,
