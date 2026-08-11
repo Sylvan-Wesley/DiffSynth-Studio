@@ -208,57 +208,65 @@ dit.clear_selection_masks()
 
 print(f"\nDenoising ({num_inference_steps} steps, RAS ratio={ratio}, "
       f"dense warm-up={num_dense_steps})...")
-for progress_id, timestep in enumerate(tqdm(scheduler.timesteps)):
-    t = timestep.unsqueeze(0).to(dtype=dtype, device=device)
 
-    # Dense steps: process ALL tokens to warm KV caches.
-    # Sparse steps: let model auto-select which tokens to process.
-    is_dense = progress_id < num_dense_steps
-    selected_patches = all_patches if is_dense else None
+# torch.inference_mode() disables autograd tracking entirely.
+# Without it, PyTorch saves intermediate tensors for all 30 DiT blocks
+# (~3 GB/block) to support backward(), causing OOM on 79 GB GPU.
+# inference_mode() is preferred over no_grad() because it also disables
+# version-counter bumps and view tracking, giving a small additional
+# memory saving.
+with torch.inference_mode():
+    for progress_id, timestep in enumerate(tqdm(scheduler.timesteps)):
+        t = timestep.unsqueeze(0).to(dtype=dtype, device=device)
 
-    # --- Positive (conditional) forward ---
-    noise_posi = dit.forward(
-        x=latents,
-        timestep=t,
-        context=ctx_posi,
-        kv_cache=kv_cache_posi,
-        ctx_kv_cache=ctx_kv_cache_posi,
-        skip_list=skip_list,
-        skip_k=skip_k,
-        selected_patches=selected_patches,
-        ratio=ratio,
-        enable_debug_masks=enable_viz,
-    )
+        # Dense steps: process ALL tokens to warm KV caches.
+        # Sparse steps: let model auto-select which tokens to process.
+        is_dense = progress_id < num_dense_steps
+        selected_patches = all_patches if is_dense else None
 
-    # Free transient memory from posi forward before running nega forward.
-    # The posi KV cache must persist for the next step, but intermediate
-    # activations from the posi forward can be released.
-    torch.cuda.empty_cache()
-
-    # --- Classifier-free guidance ---
-    if cfg_scale != 1.0:
-        noise_nega = dit.forward(
+        # --- Positive (conditional) forward ---
+        noise_posi = dit.forward(
             x=latents,
             timestep=t,
-            context=ctx_nega,
-            kv_cache=kv_cache_nega,
-            ctx_kv_cache=ctx_kv_cache_nega,
+            context=ctx_posi,
+            kv_cache=kv_cache_posi,
+            ctx_kv_cache=ctx_kv_cache_posi,
             skip_list=skip_list,
             skip_k=skip_k,
             selected_patches=selected_patches,
             ratio=ratio,
-            enable_debug_masks=False,   # only record masks for positive branch
+            enable_debug_masks=enable_viz,
         )
-        noise_pred = noise_nega + cfg_scale * (noise_posi - noise_nega)
-    else:
-        noise_pred = noise_posi
 
-    # --- Scheduler step ---
-    latents = scheduler.step(
-        noise_pred,
-        scheduler.timesteps[progress_id],
-        latents,
-    )
+        # Free transient memory from posi forward before running nega forward.
+        # The posi KV cache must persist for the next step, but intermediate
+        # activations from the posi forward can be released.
+        torch.cuda.empty_cache()
+
+        # --- Classifier-free guidance ---
+        if cfg_scale != 1.0:
+            noise_nega = dit.forward(
+                x=latents,
+                timestep=t,
+                context=ctx_nega,
+                kv_cache=kv_cache_nega,
+                ctx_kv_cache=ctx_kv_cache_nega,
+                skip_list=skip_list,
+                skip_k=skip_k,
+                selected_patches=selected_patches,
+                ratio=ratio,
+                enable_debug_masks=False,   # only record masks for positive branch
+            )
+            noise_pred = noise_nega + cfg_scale * (noise_posi - noise_nega)
+        else:
+            noise_pred = noise_posi
+
+        # --- Scheduler step ---
+        latents = scheduler.step(
+            noise_pred,
+            scheduler.timesteps[progress_id],
+            latents,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
