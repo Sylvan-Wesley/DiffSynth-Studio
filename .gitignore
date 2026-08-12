@@ -22,6 +22,11 @@ ras_masks_stale_frameavg/
 .claude
 *.gif
 
+# VBench evaluation outputs (see vbench_eval_RAS_vs_Wan.py)
+sampled_videos/
+viz/
+evaluation_results/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
