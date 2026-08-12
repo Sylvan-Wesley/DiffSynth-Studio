@@ -1,57 +1,86 @@
 """
-VBench evaluation: Original Wan2.1-T2V-1.3B vs RAS-Wan (human_action dimension).
+VBench evaluation: Original Wan2.1-T2V-1.3B vs RAS-Wan — all dimensions.
 
 End-to-end pipeline:
-  1. Generate videos for both models over the VBench human_action prompt set
+  1. Generate videos for both models over VBench's standard prompt suite
      using identical noise (same seed) per prompt so the comparison is fair.
      - original_wan  → full inference (all tokens, all steps)
      - ras_wan       → RAS sparse inference (KV cache + ratio)
   2. Visualize intermediate denoising frames side-by-side with the final
      clean frame ("with corresponding clean frame showing aside"), decoded
      from the latents captured at selected steps.
-  3. Run VBench evaluation:
-        vbench evaluate --videos_path <dir> --dimension human_action
-     once per model folder.
+  3. Run VBench evaluation (`vbench evaluate --videos_path <dir>
+     --dimension <dim>`) once per requested dimension, per model.
 
-Output layout (matches VBench's `vbench_standard` mode — flat files named
-`{prompt_en}-{sample_index}.mp4` directly inside the dimension folder):
+Dimensions and folders
+----------------------
+VBench's 16 dimensions share 11 prompt folders (identical prompt lists, per
+VBench master `dimension_to_folder.json`), so each unique prompt is generated
+exactly once and every dimension mapped to that folder is evaluated against
+the same videos — exactly the official `evaluate.sh` protocol:
+
+    subject_consistency ← subject_consistency, motion_smoothness, dynamic_degree (72)
+    scene               ← scene, background_consistency                        (86)
+    overall_consistency ← overall_consistency, aesthetic_quality,
+                          imaging_quality                                      (93)
+    object_class        ← object_class                                        (79)
+    multiple_objects    ← multiple_objects                                    (82)
+    color               ← color                                               (85)
+    spatial_relationship← spatial_relationship                                (84)
+    temporal_style      ← temporal_style                                     (100)
+    human_action        ← human_action                                       (100)
+    temporal_flickering ← temporal_flickering                                 (75)
+    appearance_style    ← appearance_style                                    (90)
+
+    946 unique prompts total.
+
+Output layout (matches VBench `vbench_standard` mode — flat files named
+`{prompt_en}-{sample_index}.mp4` directly inside the folder):
 
     sampled_videos/
     ├── original_wan/
-    │   └── human_action/
-    │       ├── A person is riding a bike-0.mp4
-    │       ├── A person is marching-0.mp4
-    │       └── ...
+    │   ├── human_action/A person is riding a bike-0.mp4
+    │   ├── scene/...
+    │   └── ...
     └── ras_wan/
-        └── human_action/
-            ├── A person is riding a bike-0.mp4
-            └── ...
+        └── ...
 
     viz/
-    ├── original_wan/prompt_000/   montage_step_XX.png, inter_step_XX.png,
-    └── ras_wan/prompt_000/        clean_frame_40.png, progression_strip.png
+    ├── original_wan/human_action/prompt_000/   montage_step_XX.png,
+    └── ras_wan/...                             clean_frame_40.png,
+                                                progression_strip.png
 
 Usage
 -----
-Smoke test (2 prompts, 1 sample, visualization on):
-    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --max_prompts 2
-
-Full human_action benchmark (all 100 prompts, 1 sample each):
-    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --max_prompts 0
+Full official benchmark — all 16 dimensions, all prompts (1 sample):
+    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions all
 
 Official VBench protocol (5 samples per prompt):
-    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --max_prompts 0 --num_samples 5
+    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions all --num_samples 5
+
+A single dimension (smoke test first, viz on):
+    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions human_action --max_prompts 2
+
+A few dimensions:
+    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions human_action,scene,temporal_flickering
+
+Shard a big run across machines:
+    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions all --prompt_start 0  --max_prompts 200 --no_evaluate
+    python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions all --prompt_start 200 --max_prompts 200 --no_evaluate
+    ...
+    (then re-run one machine with --no_evaluate removed to evaluate everything)
 
 Notes
 -----
-* The prompt list is loaded from the installed VBench package
-  (vbench/VBench_full_info.json), falling back to an embedded copy of the
-  official 100-prompt human_action list. Video filenames MUST match the
-  exact `prompt_en` strings or VBench will not find them.
-* VBench's published numbers average 5 samples per prompt; scores from
+* The prompt suite is loaded from the installed vbench package
+  (vbench/VBench_full_info.json) — the same file the evaluator reads — so the
+  generated filenames are guaranteed to match. --prompt_file overrides it.
+  For human_action only, the script falls back to an embedded copy of the
+  official 100-prompt list.
+* Existing output videos are skipped unless --force is given, so interrupted
+  or sharded runs resume without regenerating.
+* VBench's published numbers average 5 samples/prompt; scores from
   --num_samples 1 are noisier and not directly comparable.
-* Existing output videos are skipped unless --force is given, so a smoke test
-  can be followed by a full run without regenerating everything.
 """
 
 import argparse
@@ -73,9 +102,43 @@ from diffsynth.models.wan_video_dit import set_to_torch_norm, selection_mask_to_
 
 
 # ═══════════════════════════════════════════════════════════════
+# VBench dimension → prompt-folder mapping (from vbench master
+# dimension_to_folder.json). Prompts are stored ONCE per folder and shared by
+# the dimensions that map to it; this mirrors the official evaluate.sh.
+# ═══════════════════════════════════════════════════════════════
+
+DIMENSION_TO_FOLDER = {
+    "subject_consistency": "subject_consistency",
+    "background_consistency": "scene",
+    "aesthetic_quality": "overall_consistency",
+    "imaging_quality": "overall_consistency",
+    "object_class": "object_class",
+    "multiple_objects": "multiple_objects",
+    "color": "color",
+    "spatial_relationship": "spatial_relationship",
+    "scene": "scene",
+    "temporal_style": "temporal_style",
+    "overall_consistency": "overall_consistency",
+    "human_action": "human_action",
+    "temporal_flickering": "temporal_flickering",
+    "motion_smoothness": "subject_consistency",
+    "dynamic_degree": "subject_consistency",
+    "appearance_style": "appearance_style",
+}
+ALL_DIMENSIONS = list(DIMENSION_TO_FOLDER.keys())
+
+FOLDER_PROMPT_COUNTS = {  # unique prompts per folder, from VBench master full_info
+    "appearance_style": 90, "color": 85, "human_action": 100, "multiple_objects": 82,
+    "object_class": 79, "overall_consistency": 93, "scene": 86,
+    "spatial_relationship": 84, "subject_consistency": 72,
+    "temporal_flickering": 75, "temporal_style": 100,
+}
+
+
+# ═══════════════════════════════════════════════════════════════
 # Official VBench human_action prompts (from vbench/VBench_full_info.json,
-# master branch). Used only as a fallback when the installed vbench package
-# cannot be located. Video filenames must match these exactly.
+# master branch). Used only as a fallback for the human_action folder when the
+# installed vbench package cannot be located. Filenames must match these exactly.
 # ═══════════════════════════════════════════════════════════════
 
 VBENCH_HUMAN_ACTION_PROMPTS = [
@@ -190,77 +253,44 @@ NEGATIVE_PROMPT = (
 
 
 # ═══════════════════════════════════════════════════════════════
-# Prompt list resolution
+# Prompt plan resolution
 # ═══════════════════════════════════════════════════════════════
 
-def _filter_full_info(path: str, dimension: str) -> list[str]:
-    """Read a VBench_full_info.json and return the prompts for `dimension`."""
-    with open(path) as f:
-        data = json.load(f)
-    if isinstance(data, dict):
-        data = list(data.values())
-    out = []
-    for entry in data:
-        if isinstance(entry, dict):
-            dims = entry.get("dimension", [])
-            if isinstance(dims, str):
-                dims = [dims]
-            if dimension in dims and entry.get("prompt_en"):
-                out.append(entry["prompt_en"])
-        else:
-            out.append(str(entry))
-    return out
-
-
-def _load_prompts_from_file(path: str, dimension: str) -> list[str]:
-    """Load prompts from a .json (full_info list / {key: prompt} dict) or .txt."""
-    if path.lower().endswith(".json"):
-        with open(path) as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            prompts = []
-            for entry in data:
-                if isinstance(entry, dict):
-                    dims = entry.get("dimension", [])
-                    if isinstance(dims, str):
-                        dims = [dims]
-                    if dimension in dims and entry.get("prompt_en"):
-                        prompts.append(entry["prompt_en"])
-                else:
-                    prompts.append(str(entry))
-            return prompts
-        if isinstance(data, dict):
-            values = list(data.values())
-            if values and all(isinstance(v, str) for v in values):
-                return values
-            prompts = []
-            for entry in values:
-                if isinstance(entry, dict) and entry.get("prompt_en"):
-                    prompts.append(entry["prompt_en"])
-                else:
-                    prompts.append(str(entry))
-            return prompts
-    else:
-        with open(path) as f:
-            return [ln.strip() for ln in f if ln.strip()]
+def _entry_dims(entry):
+    if isinstance(entry, dict):
+        dims = entry.get("dimension", [])
+        if isinstance(dims, str):
+            dims = [dims]
+        return dims
     return []
 
 
-def resolve_prompts(args) -> tuple[list[str], str | None]:
-    """Return (prompts, full_info_path_or_None).
+def _entry_prompt(entry):
+    if isinstance(entry, dict):
+        return entry.get("prompt_en")
+    return entry if isinstance(entry, str) else None
 
-    Priority: --prompt_file, the installed vbench package's
-    VBench_full_info.json, then the embedded fallback list.
-    The full_info_path (if found) is passed to `vbench evaluate --full_json_dir`
-    so the evaluator uses exactly the prompt set the filenames were built from.
+
+def load_full_info(args):
+    """Load the full VBench prompt info.
+
+    Returns (entries, full_info_path_or_None). `entries` is a list whose
+    elements are either dicts {dimension, prompt_en} (full_info style) or plain
+    prompt strings (a single-dimension .txt list). Priority: --prompt_file,
+    then the installed vbench package's VBench_full_info.json.
     """
     if args.prompt_file:
         path = os.path.abspath(args.prompt_file)
-        prompts = _load_prompts_from_file(path, args.dimension)
-        if not prompts:
-            raise SystemExit(f"No prompts for dimension '{args.dimension}' in {path}")
-        print(f"Loaded {len(prompts)} prompts from {path}")
-        return prompts, None
+        if path.lower().endswith(".json"):
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data = list(data.values())
+            print(f"Loaded prompt info from {path}")
+            return data, path
+        lines = [ln.strip() for ln in open(path) if ln.strip()]
+        print(f"Loaded single-dimension prompt list from {path}")
+        return lines, None
 
     try:
         import vbench
@@ -269,24 +299,69 @@ def resolve_prompts(args) -> tuple[list[str], str | None]:
         pkg_dir = None
 
     if pkg_dir:
-        full_info = os.path.join(pkg_dir, "VBench_full_info.json")
-        if os.path.isfile(full_info):
-            prompts = _filter_full_info(full_info, args.dimension)
-            if prompts:
-                print(f"Loaded {len(prompts)} '{args.dimension}' prompts from VBench package:\n"
-                      f"  {full_info}")
-                return prompts, full_info
-        txt = os.path.join(pkg_dir, "prompts", "prompts_per_dimension", f"{args.dimension}.txt")
-        if os.path.isfile(txt):
-            prompts = [ln.strip() for ln in open(txt) if ln.strip()]
-            print(f"Loaded {len(prompts)} prompts from {txt}")
-            return prompts, None
-        print(f"  (no prompt file for '{args.dimension}' found under {pkg_dir})")
+        cand = os.path.join(pkg_dir, "VBench_full_info.json")
+        if os.path.isfile(cand):
+            with open(cand) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data = list(data.values())
+            print(f"Loaded prompt info from VBench package:\n  {cand}")
+            return data, cand
+        print(f"  (no VBench_full_info.json under {pkg_dir})")
+    return None, None
 
-    print("WARNING: could not locate the VBench prompt list; using the embedded "
-          "fallback list. Scores are only meaningful if the installed VBench "
-          "uses the same prompt set (master branch).")
-    return list(VBENCH_HUMAN_ACTION_PROMPTS), None
+
+def parse_dimensions(arg: str) -> list[str]:
+    if arg is None or arg.lower() == "all":
+        return list(ALL_DIMENSIONS)
+    dims = [d.strip() for d in str(arg).split(",") if d.strip()]
+    unknown = [d for d in dims if d not in DIMENSION_TO_FOLDER]
+    if unknown:
+        raise SystemExit(f"Unknown dimension(s): {unknown}. Valid dimensions:\n"
+                         f"  {', '.join(ALL_DIMENSIONS)}")
+    return dims
+
+
+def build_plan(dims, entries, args):
+    """Build a generation plan.
+
+    Returns {folder: {"members": [dims...], "prompts": [(folder_idx, global_idx, prompt)...]}}.
+    Only the folders of the requested dimensions are included; prompts within a
+    shared folder are generated once and serve every dimension mapped to it.
+    folder_idx is the prompt's position within its folder's FULL list (0..n-1) and
+    is what seeds depend on, so sharded runs (--prompt_start/--max_prompts) use
+    identical noise to a full run. global_idx is its position in the prompt source
+    (for stable per-prompt directory names).
+    """
+    # Plain prompt list (e.g. a .txt) → single-dimension mode.
+    if entries is not None and all(not _entry_dims(e) for e in entries):
+        if len(dims) != 1:
+            raise SystemExit("--prompt_file with a plain prompt list requires exactly "
+                             "one --dimensions value (the list has no dimension info).")
+        folder = DIMENSION_TO_FOLDER[dims[0]]
+        return {folder: {"members": list(dims),
+                         "prompts": [(i, i, str(e)) for i, e in enumerate(entries)]}}
+
+    plan = {}
+    folders = sorted({DIMENSION_TO_FOLDER[d] for d in dims})
+    for folder in folders:
+        members = [d for d in dims if DIMENSION_TO_FOLDER[d] == folder]
+        prompts = []
+        if entries is not None:
+            for g, e in enumerate(entries):
+                if _entry_prompt(e) and any(m in _entry_dims(e) for m in members):
+                    prompts.append((len(prompts), g, _entry_prompt(e)))
+        if not prompts:
+            if folder == "human_action":
+                print(f"  (folder '{folder}': no source prompts found — using the embedded "
+                      f"official human_action list)")
+                prompts = [(i, i, p) for i, p in enumerate(VBENCH_HUMAN_ACTION_PROMPTS)]
+            else:
+                raise SystemExit(
+                    f"No prompt source for folder '{folder}'. Ensure vbench is installed "
+                    f"(vbench/VBench_full_info.json) or pass --prompt_file.")
+        plan[folder] = {"members": members, "prompts": prompts}
+    return plan
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -533,7 +608,7 @@ def save_ras_masks(dit, out_dir):
 # VBench evaluation
 # ═══════════════════════════════════════════════════════════════
 
-def run_vbench_evaluate(model, videos_dir, args, full_info_path):
+def run_vbench_evaluate(model, dimension, videos_dir, args, full_info_path):
     if shutil.which("vbench") is None:
         print("  ERROR: 'vbench' command not found on PATH. Install VBench "
               "(pip install vbench) or pass --no_evaluate.")
@@ -541,7 +616,7 @@ def run_vbench_evaluate(model, videos_dir, args, full_info_path):
     cmd = [
         "vbench", "evaluate",
         "--videos_path", videos_dir,
-        "--dimension", args.dimension,
+        "--dimension", dimension,
         "--output_path", os.path.join(args.eval_output_root, model),
         "--ngpus", str(args.ngpus),
     ]
@@ -564,33 +639,38 @@ def run_vbench_evaluate(model, videos_dir, args, full_info_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="VBench human_action evaluation for original Wan vs RAS-Wan.",
+        description="VBench evaluation for original Wan vs RAS-Wan (all dimensions).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # smoke test (2 prompts, 1 sample, viz on)\n"
-            "  python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --max_prompts 2\n"
-            "  # full human_action benchmark (all prompts)\n"
-            "  python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --max_prompts 0\n"
-            "  # official VBench protocol\n"
-            "  python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --max_prompts 0 --num_samples 5\n"
+            "  # smoke test (1 dimension, 2 prompts, viz on)\n"
+            "  python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions human_action --max_prompts 2\n"
+            "  # full official benchmark (all 16 dimensions, all 946 prompts)\n"
+            "  python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions all\n"
+            "  # official VBench protocol (5 samples per prompt)\n"
+            "  python examples/wanvideo/model_inference/vbench_eval_RAS_vs_Wan.py --dimensions all --num_samples 5\n"
         ),
     )
 
     # What / where
     parser.add_argument("--model_id", default="Wan-AI/Wan2.1-T2V-1.3B")
-    parser.add_argument("--dimension", default="human_action")
+    parser.add_argument("--dimensions", default="all",
+                        help="Comma-separated VBench dimensions to evaluate, or 'all' "
+                             f"(all 16: {', '.join(ALL_DIMENSIONS)}).")
+    parser.add_argument("--dimension", dest="dimension_alias", default=None,
+                        help=argparse.SUPPRESS)  # singular alias, as in the vbench CLI
     parser.add_argument("--prompt_file", default=None,
-                        help="Override prompt source: VBench_full_info.json, a "
-                             "prompts_per_dimension .txt, or a JSON {key: prompt} dict.")
+                        help="Override prompt source: a VBench_full_info.json, a "
+                             "prompts_per_dimension .txt (single dimension), or a "
+                             "JSON {key: prompt} dict.")
     parser.add_argument("--prompt_start", type=int, default=0,
-                        help="First prompt index to generate (for sharding).")
+                        help="First prompt index to generate per folder (for sharding).")
     parser.add_argument("--max_prompts", type=int, default=0,
-                        help="Number of prompts to generate (0 = all for the dimension).")
+                        help="Number of prompts to generate per folder (0 = all).")
     parser.add_argument("--num_samples", type=int, default=1,
                         help="Per-prompt sample count. VBench's official protocol uses 5.")
     parser.add_argument("--videos_root", default="sampled_videos",
-                        help="Root that receives {videos_root}/{model}/{dimension}/.")
+                        help="Root that receives {videos_root}/{model}/{folder}/.")
     parser.add_argument("--model_names", default="original_wan,ras_wan",
                         help="Comma-separated model folder names. Names containing 'ras' "
                              "use the RAS sparse path; others use full inference.")
@@ -606,7 +686,9 @@ def parse_args():
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--seed", type=int, default=0,
-                        help="Base seed; per-sample seed = seed + prompt_idx*num_samples + sample.")
+                        help="Base seed; per-sample seed = seed + prompt_idx*num_samples + sample "
+                             "(prompt_idx is the prompt's index in the full prompt suite, so seeds "
+                             "are stable across sharded runs).")
     parser.add_argument("--negative_prompt", default=NEGATIVE_PROMPT)
 
     # RAS
@@ -623,7 +705,7 @@ def parse_args():
     parser.add_argument("--no_viz", action="store_true",
                         help="Disable intermediate-frame visualization.")
     parser.add_argument("--viz_prompts", type=int, default=1,
-                        help="How many prompts get the full visualization treatment.")
+                        help="How many prompts per folder get the full visualization treatment.")
     parser.add_argument("--viz_steps", default="5,10,20,30,40",
                         help="Comma-separated denoising step indices at which to capture "
                              "intermediate latents.")
@@ -647,33 +729,48 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ── Prompts ──────────────────────────────────────────────────────
-    prompts, full_info_path = resolve_prompts(args)
+    # ── Prompt plan ────────────────────────────────────────────────
+    dims = parse_dimensions(args.dimension_alias or args.dimensions)
+    entries, full_info_path = load_full_info(args)
+    plan = build_plan(dims, entries, args)
+
+    # Slice per folder for sharding.
     start = args.prompt_start
-    end = start + args.max_prompts if args.max_prompts > 0 else len(prompts)
-    prompts = prompts[start:end]
-    if not prompts:
-        raise SystemExit("No prompts selected. Check --prompt_start/--max_prompts.")
+    selected_plan = {}
+    for folder, info in plan.items():
+        ps = info["prompts"]
+        sel = ps[start:] if args.max_prompts <= 0 else ps[start:start + args.max_prompts]
+        selected_plan[folder] = {"members": info["members"], "prompts": sel}
 
     models = [m.strip() for m in args.model_names.split(",") if m.strip()]
     if not models:
         raise SystemExit("--model_names is empty.")
 
-    num_videos = len(prompts) * args.num_samples * len(models)
+    n_prompts = sum(len(i["prompts"]) for i in selected_plan.values())
+    num_videos = n_prompts * args.num_samples * len(models)
+
     print("=" * 72)
     print("VBench evaluation: original Wan vs RAS-Wan")
     print("=" * 72)
-    print(f"  dimension          : {args.dimension}")
-    print(f"  prompts            : {len(prompts)} (indices {start}..{end - 1})")
+    print(f"  dimensions         : {len(dims)}  ({', '.join(dims)})")
+    print(f"  folders            : {len(selected_plan)}  (shared prompt sets)")
+    for folder, info in selected_plan.items():
+        full = FOLDER_PROMPT_COUNTS.get(folder, "?")
+        print(f"      {folder:<22} {len(info['prompts']):>3}/{full} prompts "
+              f"(dims: {', '.join(info['members'])})")
     print(f"  samples / prompt   : {args.num_samples}  (VBench official = 5)")
     print(f"  models             : {', '.join(models)}")
     print(f"  videos to generate : {num_videos}")
     if args.num_samples != 5:
         print("  NOTE: --num_samples != 5 → scores are not directly comparable to")
         print("        published VBench numbers (which average 5 samples/prompt).")
-    if args.max_prompts != 0:
-        print("  NOTE: only a subset of prompts will be generated — the reported score")
-        print("        is a partial approximation over the prompts present.")
+    if args.max_prompts != 0 or args.prompt_start != 0:
+        print("  NOTE: sharded/partial run — reported scores are partial approximations")
+        print("        over the prompts generated so far.")
+    if args.prompt_start == 0 and args.max_prompts == 0 and num_videos > 1000:
+        print("  NOTE: this is the full 946-prompt benchmark (~2k videos for 2 models).")
+        print("        Prefer sharding with --prompt_start/--max_prompts --no_evaluate,")
+        print("        or a smoke test: --dimensions human_action --max_prompts 2.")
     print()
 
     # ── Model ────────────────────────────────────────────────────────
@@ -702,19 +799,6 @@ def main():
     geo = geometry(pipe, args.num_frames, args.height, args.width)
     print(f"  Latent shape: {geo['shape']}, tokens S={geo['S']}")
 
-    # ── Encode all prompts up front, then drop the (large) T5 encoder ──
-    print(f"Encoding {len(prompts)} prompts + negative prompt...")
-    ctx_posi_all = [encode_prompt(pipe, p) for p in prompts]
-    ctx_nega = encode_prompt(pipe, args.negative_prompt)
-    pipe.text_encoder.to("cpu")
-    if not args.keep_vae_on_gpu:
-        vae.to("cpu")
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    if torch.cuda.is_available():
-        free, total = torch.cuda.mem_get_info()
-        print(f"  GPU memory in use before generation: {(total - free) / 1024**3:.1f} GiB")
-
     # ── Visualization setup ──────────────────────────────────────────
     viz_frame = args.viz_frame if args.viz_frame is not None else args.num_frames // 2
     if not args.no_viz:
@@ -729,67 +813,78 @@ def main():
     total_time = {m: 0.0 for m in models}
     n_done = {m: 0 for m in models}
 
-    for pidx, prompt in enumerate(tqdm(prompts, desc="prompts")):
-        rel_pidx = start + pidx
-        ctx_posi = ctx_posi_all[pidx]
-        print(f"\nPrompt {rel_pidx}: {prompt}")
+    for folder, info in selected_plan.items():
+        print(f"\n===== Folder: {folder}  (dimensions: {', '.join(info['members'])}) =====")
+        print(f"Encoding {len(info['prompts'])} prompts for this folder...")
 
-        for model in models:
-            mode = "ras" if "ras" in model else "full"
-            out_dir = os.path.join(args.videos_root, model, args.dimension)
-            os.makedirs(out_dir, exist_ok=True)
-            do_viz = bool(capture_steps) and pidx < args.viz_prompts
+        # Encode this folder's prompts up front, then drop the (large) T5 encoder.
+        ctx_posi_all = [encode_prompt(pipe, p) for _, _, p in info["prompts"]]
+        ctx_nega = encode_prompt(pipe, args.negative_prompt)
+        pipe.text_encoder.to("cpu")
+        if not args.keep_vae_on_gpu:
+            vae.to("cpu")
+        torch.cuda.empty_cache()
 
-            for s in range(args.num_samples):
-                seed = args.seed + rel_pidx * args.num_samples + s
-                vid_path = os.path.join(out_dir, f"{prompt}-{s}.mp4")
+        for j, (folder_idx, gidx, prompt) in enumerate(tqdm(info["prompts"], desc=f"folder {folder}")):
+            ctx_posi = ctx_posi_all[j]
+            print(f"\nPrompt {folder_idx} (source #{gidx}): {prompt}")
 
-                if os.path.exists(vid_path) and not args.force:
-                    print(f"  [{model}/{s}] skip (exists): {vid_path}")
-                    continue
+            for model in models:
+                mode = "ras" if "ras" in model else "full"
+                out_dir = os.path.join(args.videos_root, model, folder)
+                os.makedirs(out_dir, exist_ok=True)
+                do_viz = bool(capture_steps) and j < args.viz_prompts
 
-                latents = pipe.generate_noise(geo["shape"], seed=seed, rand_device="cpu")
-                latents = latents.to(dtype=dtype, device=device)
+                for s in range(args.num_samples):
+                    seed = args.seed + folder_idx * args.num_samples + s
+                    vid_path = os.path.join(out_dir, f"{prompt}-{s}.mp4")
 
-                final, captured, elapsed = run_denoise(
-                    dit, scheduler, latents, ctx_posi, ctx_nega,
-                    cfg_scale=args.cfg_scale,
-                    mode=mode,
-                    ratio=args.ratio,
-                    num_dense_steps=args.num_dense_steps,
-                    extra_dense_steps={int(x) for x in args.extra_dense_steps.split(",") if x.strip()},
-                    dumb_update=args.dumb_update,
-                    S=geo["S"],
-                    dtype=dtype,
-                    device=device,
-                    capture_steps=capture_steps if do_viz else set(),
-                    enable_masks=bool(args.save_masks and mode == "ras"),
-                )
+                    if os.path.exists(vid_path) and not args.force:
+                        print(f"  [{model}/{s}] skip (exists): {vid_path}")
+                        continue
 
-                # Decode final video (VAE on GPU)
-                vae.to(device)
-                frames = decode_video(pipe, vae, final, device)
-                save_video(frames, vid_path, fps=args.fps, quality=5)
+                    latents = pipe.generate_noise(geo["shape"], seed=seed, rand_device="cpu")
+                    latents = latents.to(dtype=dtype, device=device)
 
-                # Intermediate-frame visualization (VAE still on GPU)
-                if do_viz and captured:
-                    clean = frames[viz_frame]
-                    viz_out = os.path.join(args.viz_dir, model, f"prompt_{rel_pidx:03d}")
-                    save_intermediate_viz(viz_out, captured, clean, viz_frame,
-                                          dtype, device, pipe, vae)
-                    print(f"  intermediate-frame montages -> {viz_out}/")
+                    final, captured, elapsed = run_denoise(
+                        dit, scheduler, latents, ctx_posi, ctx_nega,
+                        cfg_scale=args.cfg_scale,
+                        mode=mode,
+                        ratio=args.ratio,
+                        num_dense_steps=args.num_dense_steps,
+                        extra_dense_steps={int(x) for x in args.extra_dense_steps.split(",") if x.strip()},
+                        dumb_update=args.dumb_update,
+                        S=geo["S"],
+                        dtype=dtype,
+                        device=device,
+                        capture_steps=capture_steps if do_viz else set(),
+                        enable_masks=bool(args.save_masks and mode == "ras"),
+                    )
 
-                if args.save_masks and mode == "ras":
-                    masks_out = os.path.join(args.viz_dir, model, f"prompt_{rel_pidx:03d}", "masks")
-                    save_ras_masks(dit, masks_out)
+                    # Decode final video (VAE on GPU)
+                    vae.to(device)
+                    frames = decode_video(pipe, vae, final, device)
+                    save_video(frames, vid_path, fps=args.fps, quality=5)
 
-                if not args.keep_vae_on_gpu:
-                    vae.to("cpu")
-                torch.cuda.empty_cache()
+                    # Intermediate-frame visualization (VAE still on GPU)
+                    if do_viz and captured:
+                        clean = frames[viz_frame]
+                        viz_out = os.path.join(args.viz_dir, model, folder, f"prompt_{gidx:03d}")
+                        save_intermediate_viz(viz_out, captured, clean, viz_frame,
+                                              dtype, device, pipe, vae)
+                        print(f"  intermediate-frame montages -> {viz_out}/")
 
-                total_time[model] += elapsed
-                n_done[model] += 1
-                print(f"  [{model}/{s}] {elapsed:6.1f}s  {elapsed / args.num_inference_steps:5.1f} ms/step  -> {vid_path}")
+                    if args.save_masks and mode == "ras":
+                        masks_out = os.path.join(args.viz_dir, model, folder, f"prompt_{gidx:03d}", "masks")
+                        save_ras_masks(dit, masks_out)
+
+                    if not args.keep_vae_on_gpu:
+                        vae.to("cpu")
+                    torch.cuda.empty_cache()
+
+                    total_time[model] += elapsed
+                    n_done[model] += 1
+                    print(f"  [{model}/{s}] {elapsed:6.1f}s  {elapsed / args.num_inference_steps:5.1f} ms/step  -> {vid_path}")
 
     # ── Report ───────────────────────────────────────────────────────
     print("\n" + "=" * 72)
@@ -802,15 +897,17 @@ def main():
                   f"avg {avg:6.1f}s/video")
         else:
             print(f"  {model:<14s} 0 videos (all skipped)")
-    print(f"\n  Videos:  {os.path.abspath(args.videos_root)}/<model>/{args.dimension}/")
+    print(f"\n  Videos:  {os.path.abspath(args.videos_root)}/<model>/<folder>/")
     print(f"  Montages:{os.path.abspath(args.viz_dir)}/")
 
     # ── VBench evaluation ────────────────────────────────────────────
     if args.no_evaluate:
         print("\nSkipping VBench evaluation (--no_evaluate). Run it manually, e.g.:")
         for model in models:
-            print(f"    vbench evaluate --videos_path \"{args.videos_root}/{model}/{args.dimension}\" "
-                  f"--dimension {args.dimension}")
+            for dim in dims:
+                folder = DIMENSION_TO_FOLDER[dim]
+                print(f"    vbench evaluate --videos_path \"{args.videos_root}/{model}/{folder}\" "
+                      f"--dimension {dim}")
         return
 
     print("\n" + "=" * 72)
@@ -818,10 +915,12 @@ def main():
     print("=" * 72)
     failures = 0
     for model in models:
-        videos_dir = os.path.abspath(os.path.join(args.videos_root, model, args.dimension))
-        rc = run_vbench_evaluate(model, videos_dir, args, full_info_path)
-        failures += 1 if rc != 0 else 0
-        print(f"  Results: {os.path.abspath(args.eval_output_root)}/{model}/")
+        for dim in dims:
+            folder = DIMENSION_TO_FOLDER[dim]
+            videos_dir = os.path.abspath(os.path.join(args.videos_root, model, folder))
+            rc = run_vbench_evaluate(model, dim, videos_dir, args, full_info_path)
+            failures += 1 if rc != 0 else 0
+            print(f"  Results: {os.path.abspath(args.eval_output_root)}/{model}/")
 
     if failures:
         sys.exit(f"{failures} VBench evaluation(s) failed — see output above.")
