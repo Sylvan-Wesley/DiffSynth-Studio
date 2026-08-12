@@ -10,11 +10,12 @@ and contains NO RAS code** — never base RAS changes on it.
 
 ## Files
 - `examples/wanvideo/model_inference/RAS-Wan2.1-T2V-1.3B.py` — main inference script. Owns all
-  RAS state (KV caches, skip counters, dense warm-up), runs CFG, decodes. Config knobs at top.
+  RAS state (KV caches, skip counters, dense warm-up), runs CFG, decodes. Config knobs at top
+  (`ratio`, `num_dense_steps`, `dumb_update`, `enable_viz`, `viz_mask_mode`).
 - `examples/wanvideo/model_inference/benchmark_RAS_vs_Wan.py` — times full inference
   (`kv_cache=None`) vs RAS (`kv_cache`+`ratio`) through `WanModel.forward()` directly.
-- `examples/wanvideo/model_inference/visualize_ras_masks.py` — (untracked; working copy only)
-  heatmap overlay of per-step selection masks.
+- `examples/wanvideo/model_inference/visualize_ras_masks.py` — heatmap overlay of per-step
+  selection masks.
 - `diffsynth/models/wan_video_dit.py` — ALL RAS machinery (module helpers + `WanModel` methods).
 
 ## Structure of `diffsynth/models/wan_video_dit.py` (grep-verified line refs)
@@ -27,35 +28,41 @@ Module helpers:
 - `set_to_torch_norm` (184) — switches RMSNorm to fused `F.rms_norm`.
 
 Model:
-- `SelfAttention.forward` (239) — with cache + `selected_patches`: compute q for active tokens;
+- `SelfAttention.forward` (223) — with cache + `selected_patches`: compute q for active tokens;
   compute k/v for active and **scatter back** into full cached tensors; inactive read stale k/v.
-- `CrossAttention.forward` (291) — ctx K/V cached per layer; q computed only for active tokens.
-- `DiTBlock.forward` (359) — threads `selected_patches` + both caches through self/cross/ffn.
-- `Head.forward` (407) — outputs token-level noise `[B, S, out_dim*prod(patch_size)]`.
-- `WanModel`: `_prev_noise_tokens` (552); `patchify` (629); `unpatchify` (645);
-  `select_region` (652); `update_skip_record` (700); `get_selection_masks` (716);
-  `clear_selection_masks` (723); `forward` (727; RAS region-selection block begins ~line 762).
+- `CrossAttention.forward` (270) — ctx K/V cached per layer; q computed only for active tokens.
+- `DiTBlock.forward` (340) — threads `selected_patches` + both caches through self/cross/ffn.
+- `Head.forward` (398) — outputs token-level noise `[B, S, out_dim*prod(patch_size)]`.
+- `WanModel`: `_prev_noise_tokens` (552); `_last_selected_patches` (557); `patchify` (634);
+  `unpatchify` (650); `select_region` (657); `update_skip_record` (705); `get_selection_masks`
+  (721); `clear_selection_masks` (728); `get_last_selected_patches` (732); `forward` (740).
 
 ## Per-step data flow
-1. **Dense warm-up** (`num_dense_steps`, default 3) runs ALL tokens — seeds per-layer KV caches
-   and `_prev_noise_tokens`. Sparse steps follow.
-2. **Sparse step** — `select_region` picks top-k tokens:
+1. **Dense warm-up** (`num_dense_steps`, default 20) runs ALL tokens — seeds per-layer KV caches
+   and `_prev_noise_tokens`. The script also forces a few mid-run dense steps (e.g. indices 30/40)
+   to refresh stale KV caches. Sparse steps follow.
+2. **Sparse step** — `select_region` (positive branch only) picks top-k tokens:
    `importance = 1/(std(prev_noise)+eps)` (low variance = semantically settled = safe to skip),
    `score = importance * exp(k_starvation * skip_k)` (starvation prevention). First step has no
    prev noise → falls back to L2 norm of latents.
 3. `update_skip_record` — reset selected tokens' drop counter to 0, then increment all
-   (unselected accumulate, selected → 1).
-4. DiT blocks run ONLY on gathered active tokens (see attention notes above).
-5. **Head / dumb update**: active → fresh prediction; inactive → **reuse `_prev_noise_tokens`**
-   (carry forward the last real prediction). `head()` is only valid on DiT-block OUTPUT, so the
-   old `head(raw_input)` path is a fallback only, used when no prior prediction exists. Store the
-   mixed full-sequence prediction back to `_prev_noise_tokens` (drives next step's selection AND
-   dumb reuse).
-6. Unpatchify → `noise_pred` → `scheduler.step`.
-7. **CFG** runs TWO forwards (posi/nega) sharing `skip_list`/`skip_k` and one `_prev_noise_tokens`
-   buffer — both branches select the SAME regions. Known nuance: posi's inactive tokens reuse
-   nega's stale prediction and vice versa (valid CFG mix of stale preds). Per-branch buffers =
-   possible follow-up.
+   (unselected accumulate, selected → 1). Called ONLY on the positive branch; the negative branch
+   reuses the selection (step 4) so the record isn't double-updated.
+4. **Selection sharing** — after every forward, `_last_selected_patches` holds the indices used
+   and `get_last_selected_patches()` returns them. The script passes them to the NEGATIVE branch
+   as `selected_patches`, so both CFG branches process the same tokens. This avoids re-deriving
+   the selection from a different `_prev_noise_tokens` and double-updating the skip record.
+5. DiT blocks run ONLY on gathered active tokens (see attention notes above).
+6. **Head / dumb update** — active: fresh prediction. Inactive: strategy from `dumb_update`
+   (default `"Previous"`):
+   - `"Previous"` — carry forward `_prev_noise_tokens` (last real prediction).
+   - `"Zero"` — predict zero noise for inactive tokens.
+   - any other value → `ValueError`.
+   head-on-raw is a fallback ONLY when `_prev_noise_tokens is None` (head is trained on DiT-block
+   output, so raw input gives garbage). Store the mixed full-sequence prediction back to
+   `_prev_noise_tokens`. Because both branches reuse the SAME stale value for inactive tokens,
+   the CFG combination `nega + cfg*(posi - nega)` collapses to exactly that stale prediction.
+7. Unpatchify → `noise_pred` → `scheduler.step`.
 
 ## Gotchas (don't rediscover these)
 - **Token count S is AFTER patchify**: `S = f * (h//patch_size[1]) * (w//patch_size[2])`, NOT VAE
@@ -67,13 +74,18 @@ Model:
   - RMSNorm: `set_to_torch_norm` (fused `F.rms_norm`) avoids full float32 copies.
   - `expandable_segments` was REMOVED — it blocked T5 GPU memory release.
   - Offload T5 text encoder + VAE to CPU after prompt encoding / before decode.
-- `_prev_noise_tokens` is reset to `None` before the loop; sparse steps with no prior prediction
-  hit the head-on-raw fallback (keep it working).
+- `_prev_noise_tokens` and `_last_selected_patches` are reset to `None` before the loop; sparse
+  steps with no prior prediction hit the head-on-raw fallback (keep it working).
+- The NEGATIVE CFG branch MUST receive the positive branch's `selected_patches` (via
+  `get_last_selected_patches()`) on sparse steps — never let it call `select_region` again.
+- The script passes `dumb_update` only to the positive branch; the negative branch uses the model
+  default (`"Previous"`). Mismatched modes would break the inactive-token CFG collapse — keep both
+  `"Previous"` or wire the mode through to the negative branch too.
 - KV caches persist across steps → dense warm-up required before sparse steps.
 - Eval-only; `inference_mode` forbids autograd.
 
 ## Running
-- Model: `Wan-AI/Wan2.1-T2V-1.3B`. Defaults: `ratio=0.25`, `num_dense_steps=3`,
-  `num_inference_steps=50`, `cfg_scale=5.0`, 81 frames @ 480×832.
+- Model: `Wan-AI/Wan2.1-T2V-1.3B`. Defaults: `ratio=0.25`, `num_dense_steps=20`,
+  `dumb_update="Previous"`, `num_inference_steps=50`, `cfg_scale=5.0`, 81 frames @ 480×832.
 - `python examples/wanvideo/model_inference/RAS-Wan2.1-T2V-1.3B.py` → `ras_output.mp4`; with
-  `enable_viz=True`, per-step mask `.npy` files under `ras_masks/`.
+  `enable_viz=True`, per-step selection masks under `ras_masks/` (format via `viz_mask_mode`).
