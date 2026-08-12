@@ -43,7 +43,7 @@ prompt = "纪实摄影风格画面，一只活泼的小狗在绿茵茵的草地�
 
 negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
-num_inference_steps = 30
+num_inference_steps = 50  # official Wan2.1 default
 cfg_scale = 5.0
 seed = 0
 num_frames = 81
@@ -52,8 +52,12 @@ width = 832
 
 # RAS
 ratio = 0.25                # fraction of tokens updated per step (1.0 = full, 0.25 = 4x fewer)
-num_dense_steps = 3         # initial steps with full updates to warm KV caches
+num_dense_steps = 20         # initial steps with full updates to warm KV caches
 enable_viz = True           # store per-step selection masks for visualization
+viz_mask_mode = "per_frame" # how selection masks are saved:
+                            #   "frame_avg"  → one [h, w] map per step (averaged over frames) [default]
+                            #   "per_frame"  → one [h, w] map per (step, frame)   mask_step_XX_f_KK_t_...
+                            #   "full_grid"  → one [f, h, w] grid per step        mask_step_XX_f_all_t_...
 
 # Output
 output_path = "ras_output.mp4"
@@ -245,6 +249,14 @@ with torch.inference_mode():
 
         # --- Classifier-free guidance ---
         if cfg_scale != 1.0:
+            # The negative branch must process the SAME tokens as the positive
+            # branch. On sparse steps (selected_patches is None) pass the posi
+            # selection explicitly; otherwise forward() would re-derive it from
+            # a different _prev_noise_tokens and double-update the skip record.
+            nega_selected = (
+                dit.get_last_selected_patches()
+                if selected_patches is None else selected_patches
+            )
             noise_nega = dit.forward(
                 x=latents,
                 timestep=t,
@@ -253,7 +265,7 @@ with torch.inference_mode():
                 ctx_kv_cache=ctx_kv_cache_nega,
                 skip_list=skip_list,
                 skip_k=skip_k,
-                selected_patches=selected_patches,
+                selected_patches=nega_selected,
                 ratio=ratio,
                 enable_debug_masks=False,   # only record masks for positive branch
             )
@@ -305,16 +317,29 @@ if enable_viz:
               f"grid shape={list(grid.shape)}  "
               f"grid_size=({f},{h},{w})")
 
-    # Save per-frame mask grids for the first batch element
-    # Upsample spatial dimensions (h, w) to match output resolution for overlay
+    # Save selection masks (numpy) for external visualization.
+    # viz_mask_mode controls how the temporal dimension is kept:
+    #   "frame_avg"  → one [h, w] map per step (averaged over frames)   [default]
+    #   "per_frame"  → one [h, w] map per (step, frame)                 (frame k)
+    #   "full_grid"  → one [f, h, w] grid per step (all frames)
     import os
     os.makedirs(viz_output_dir, exist_ok=True)
     for idx, (t_val, mask, (f, h, w)) in enumerate(masks):
-        grid = selection_mask_to_grid(mask, (f, h, w))  # [1, 1, f, h, w]
-        # Average over frames for a summary frame mask
-        frame_mask = grid[0, 0].mean(dim=0).cpu().numpy()  # [h, w] in patch space
-        # Save as numpy for external visualization
-        np.save(f"{viz_output_dir}/mask_step_{idx:02d}_t_{t_val:.0f}.npy", frame_mask)
+        grid = selection_mask_to_grid(mask, (f, h, w))   # [1, 1, f, h, w]
+        grid_f = grid[0, 0]                              # [f, h, w] in patch space
+        if viz_mask_mode == "frame_avg":
+            # Average over frames for a summary frame mask
+            frame_mask = grid_f.mean(dim=0).cpu().numpy()  # [h, w]
+            np.save(f"{viz_output_dir}/mask_step_{idx:02d}_t_{t_val:.0f}.npy", frame_mask)
+        elif viz_mask_mode == "per_frame":
+            for k in range(f):
+                fm = grid_f[k].cpu().numpy()              # [h, w] for frame k
+                np.save(f"{viz_output_dir}/mask_step_{idx:02d}_f_{k:02d}_t_{t_val:.0f}.npy", fm)
+        elif viz_mask_mode == "full_grid":
+            np.save(f"{viz_output_dir}/mask_step_{idx:02d}_f_all_t_{t_val:.0f}.npy",
+                    grid_f.cpu().numpy())                 # [f, h, w]
+        else:
+            raise ValueError(f"Unknown viz_mask_mode: {viz_mask_mode!r}")
 
     print(f"  Mask arrays saved to: {viz_output_dir}/")
     print(f"  To visualize as heatmap overlay, upsample each {h}×{w} mask to {height}×{width}")

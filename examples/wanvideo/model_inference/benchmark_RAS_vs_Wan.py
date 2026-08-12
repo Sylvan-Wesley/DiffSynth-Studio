@@ -37,7 +37,7 @@ prompt = "纪实摄影风格画面，一只活泼的小狗在绿茵茵的草地�
 
 negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
-num_inference_steps = 30
+num_inference_steps = 50  # official Wan2.1 default
 cfg_scale = 5.0
 seed = 0
 num_frames = 81
@@ -157,11 +157,17 @@ def denoise_step(latents, t, kv_cache_posi, ctx_kv_cache_posi,
 
     # CFG
     if cfg_scale != 1.0:
+        # Reuse the positive branch's selection so both CFG branches process
+        # the same tokens (and the skip record updates once per step, not twice).
+        nega_selected = (
+            dit.get_last_selected_patches()
+            if selected_patches is None else selected_patches
+        )
         noise_nega = dit.forward(
             x=latents, timestep=t, context=ctx_nega,
             kv_cache=kv_cache_nega, ctx_kv_cache=ctx_kv_cache_nega,
             skip_list=skip_list, skip_k=skip_k,
-            selected_patches=selected_patches,
+            selected_patches=nega_selected,
             ratio=ratio_val, enable_debug_masks=False,
         )
         noise_pred = noise_nega + cfg_scale * (noise_posi - noise_nega)

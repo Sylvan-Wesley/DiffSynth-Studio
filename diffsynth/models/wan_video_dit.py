@@ -551,6 +551,11 @@ class WanModel(torch.nn.Module):
         # Used by select_region to compute per-token std dev for variance-based selection
         self._prev_noise_tokens = None
 
+        # RAS: token indices selected by the most recent forward() call. Lets the
+        # negative CFG branch reuse the positive branch's selection instead of
+        # re-deriving it from a different _prev_noise_tokens.
+        self._last_selected_patches = None
+
         # RAS debug: stores (timestep, mask [B, S], grid_size (f, h, w)) per RAS step
         self.debug_masks = []
 
@@ -724,6 +729,14 @@ class WanModel(torch.nn.Module):
         """Clear stored selection masks to free memory."""
         self.debug_masks = []
 
+    def get_last_selected_patches(self):
+        """Return the token indices selected by the most recent forward() call.
+
+        Lets the negative CFG branch reuse the positive branch's selection so
+        both branches process the same tokens (see RAS-Wan2.1-T2V-1.3B.py).
+        """
+        return self._last_selected_patches
+
     def forward(self,
                 x: torch.Tensor,
                 timestep: torch.Tensor,
@@ -770,6 +783,10 @@ class WanModel(torch.nn.Module):
                                                       y, **kwargs)
                 self.update_skip_record(skip_list, skip_k, region_selected)
                 is_full = False
+
+            # Remember the selection so the negative CFG branch can process the
+            # same tokens as the positive branch (see RAS-Wan2.1-T2V-1.3B.py).
+            self._last_selected_patches = region_selected
 
             # Safety: validate that selected indices are within the token sequence bounds.
             # A common mistake is computing S from VAE latent dims instead of patched dims.
