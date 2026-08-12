@@ -368,8 +368,14 @@ def build_plan(dims, entries, args):
 # Model / prompt helpers
 # ═══════════════════════════════════════════════════════════════
 
+@torch.no_grad()
 def encode_prompt(pipe, prompt: str) -> torch.Tensor:
-    """Encode a text prompt with the pipeline's T5 tokenizer + text encoder."""
+    """Encode a text prompt with the pipeline's T5 tokenizer + text encoder.
+
+    no_grad() is essential here: the T5 encoder is 24 layers of full (non-flash)
+    attention over a seq_len-padded sequence; without it, autograd retains every
+    layer's activations and the encoder alone can consume tens of GB.
+    """
     ids, mask = pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
     ids = ids.to(pipe.device)
     mask = mask.to(pipe.device)
@@ -689,6 +695,11 @@ def parse_args():
                         help="Base seed; per-sample seed = seed + prompt_idx*num_samples + sample "
                              "(prompt_idx is the prompt's index in the full prompt suite, so seeds "
                              "are stable across sharded runs).")
+    parser.add_argument("--text_seq_len", type=int, default=512,
+                        help="Max text-encoder sequence length (Wan's tokenizer pads to 512). "
+                             "T5 attention memory grows as O(L^2), so lowering this to 128/256 "
+                             "cuts encoder memory a lot for testing. VBench prompts are short "
+                             "(< 20 tokens); 256 is plenty, 128 even safer on small GPUs.")
     parser.add_argument("--negative_prompt", default=NEGATIVE_PROMPT)
 
     # RAS
@@ -799,6 +810,17 @@ def main():
     geo = geometry(pipe, args.num_frames, args.height, args.width)
     print(f"  Latent shape: {geo['shape']}, tokens S={geo['S']}")
 
+    # Cap the text-encoder sequence length (T5 attention is O(L^2)); the
+    # pipeline's default is 512. VBench prompts are short, so this is safe and
+    # dramatically cuts encoder memory on smaller GPUs.
+    if args.text_seq_len != 512:
+        print(f"  text_encoder seq_len: 512 -> {args.text_seq_len}")
+    pipe.tokenizer.seq_len = args.text_seq_len
+
+    if torch.cuda.is_available():
+        print(f"  GPU allocated after model load: "
+              f"{torch.cuda.memory_allocated() / 1024**3:.1f} GiB")
+
     # ── Visualization setup ──────────────────────────────────────────
     viz_frame = args.viz_frame if args.viz_frame is not None else args.num_frames // 2
     if not args.no_viz:
@@ -815,6 +837,9 @@ def main():
 
     for folder, info in selected_plan.items():
         print(f"\n===== Folder: {folder}  (dimensions: {', '.join(info['members'])}) =====")
+        if torch.cuda.is_available():
+            print(f"  GPU allocated before text encoding: "
+                  f"{torch.cuda.memory_allocated() / 1024**3:.1f} GiB")
         print(f"Encoding {len(info['prompts'])} prompts for this folder...")
 
         # Encode this folder's prompts up front, then drop the (large) T5 encoder.
