@@ -17,6 +17,8 @@ image*
 *.pdf
 ras_masks/
 *.png
+*.mp4
+ras_masks_stale_frameavg/
 .claude
 *.gif
 

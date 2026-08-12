@@ -226,7 +226,7 @@ with torch.inference_mode():
 
         # Dense steps: process ALL tokens to warm KV caches.
         # Sparse steps: let model auto-select which tokens to process.
-        is_dense = progress_id < num_dense_steps
+        is_dense = progress_id < num_dense_steps or progress_id == 30 or progress_id == 40
         selected_patches = all_patches if is_dense else None
 
         # --- Positive (conditional) forward ---
