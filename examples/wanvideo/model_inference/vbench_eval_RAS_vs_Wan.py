@@ -34,21 +34,22 @@ the same videos — exactly the official `evaluate.sh` protocol:
 
     946 unique prompts total.
 
-Output layout (matches VBench `vbench_standard` mode — flat files named
-`{prompt_en}-{sample_index}.mp4` directly inside the folder):
+Default output layout (matches VBench `vbench_standard` mode — flat files
+named `{prompt_en}-{sample_index}.mp4` directly inside the folder):
 
-    sampled_videos/
-    ├── original_wan/
-    │   ├── human_action/A person is riding a bike-0.mp4
-    │   ├── scene/...
-    │   └── ...
-    └── ras_wan/
-        └── ...
-
-    viz/
-    ├── original_wan/human_action/prompt_000/   montage_step_XX.png,
-    └── ras_wan/...                             clean_frame_40.png,
-                                                progression_strip.png
+    /data2/weixinyuan/ras/
+    ├── sampled_videos/
+    │   ├── original_wan/
+    │   │   ├── human_action/A person is riding a bike-0.mp4
+    │   │   ├── scene/...
+    │   │   └── ...
+    │   └── ras_wan/
+    │       └── ...
+    ├── viz/
+    │   ├── original_wan/human_action/prompt_000/   montage_step_XX.png,
+    │   └── ras_wan/...                             clean_frame_40.png,
+    │                                               progression_strip.png
+    └── evaluation_results/
 
 Usage
 -----
@@ -98,7 +99,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-from diffsynth.models.wan_video_dit import set_to_torch_norm, selection_mask_to_grid
+from diffsynth.models.wan_video_dit import (
+    set_to_torch_norm, selection_mask_to_grid, update_noise_cache,
+)
+
+
+OUTPUT_ROOT = "/data2/weixinyuan/ras"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -432,7 +438,13 @@ def run_denoise(dit, scheduler, latents, ctx_posi, ctx_nega, *,
         ctx_posi_cache = ctx_nega_cache = None
         skip_list = skip_k = None
 
-    dit._prev_noise_tokens = None
+    # RAS state shared by both CFG branches. Each branch's dumb fill carries
+    # forward its own condition's prior prediction (posi→prev_posi, nega→
+    # prev_nega); `prev_guided_noise_tokens` is their CFG combo and drives
+    # select_region. All caches update only at active token positions.
+    prev_posi_noise_tokens = None
+    prev_nega_noise_tokens = None
+    prev_guided_noise_tokens = None
     if enable_masks:
         dit.clear_selection_masks()
 
@@ -451,7 +463,7 @@ def run_denoise(dit, scheduler, latents, ctx_posi, ctx_nega, *,
             selected = all_patches if (ras_active and is_dense) else None
 
             # --- Positive (conditional) forward ---
-            noise_posi = dit.forward(
+            noise_posi, noise_posi_tokens = dit.forward(
                 x=latents,
                 timestep=t,
                 context=ctx_posi,
@@ -463,6 +475,9 @@ def run_denoise(dit, scheduler, latents, ctx_posi, ctx_nega, *,
                 ratio=ratio if ras_active else 1.0,
                 dumb_update=dumb_update,
                 enable_debug_masks=(ras_active and enable_masks),
+                prev_noise_tokens=prev_guided_noise_tokens if ras_active else None,
+                dumb_noise_tokens=prev_posi_noise_tokens if ras_active else None,
+                return_noise_tokens=True,
             )
             torch.cuda.empty_cache()
 
@@ -475,7 +490,7 @@ def run_denoise(dit, scheduler, latents, ctx_posi, ctx_nega, *,
                     dit.get_last_selected_patches()
                     if (ras_active and selected is None) else selected
                 )
-                noise_nega = dit.forward(
+                noise_nega, noise_nega_tokens = dit.forward(
                     x=latents,
                     timestep=t,
                     context=ctx_nega,
@@ -487,10 +502,31 @@ def run_denoise(dit, scheduler, latents, ctx_posi, ctx_nega, *,
                     ratio=ratio if ras_active else 1.0,
                     dumb_update=dumb_update,
                     enable_debug_masks=False,
+                    prev_noise_tokens=prev_guided_noise_tokens if ras_active else None,
+                    dumb_noise_tokens=prev_nega_noise_tokens if ras_active else None,
+                    return_noise_tokens=True,
                 )
                 noise_pred = noise_nega + cfg_scale * (noise_posi - noise_nega)
+                guided_noise_tokens = noise_nega_tokens + cfg_scale * (
+                    noise_posi_tokens - noise_nega_tokens
+                )
+                active_patches = nega_selected
             else:
                 noise_pred = noise_posi
+                guided_noise_tokens = noise_posi_tokens
+                active_patches = dit.get_last_selected_patches()
+
+            if ras_active:
+                prev_posi_noise_tokens = update_noise_cache(
+                    prev_posi_noise_tokens, active_patches, noise_posi_tokens,
+                )
+                if cfg_scale != 1.0:
+                    prev_nega_noise_tokens = update_noise_cache(
+                        prev_nega_noise_tokens, active_patches, noise_nega_tokens,
+                    )
+                prev_guided_noise_tokens = update_noise_cache(
+                    prev_guided_noise_tokens, active_patches, guided_noise_tokens,
+                )
 
             if i in capture_steps:
                 captured[i] = (float(ts.item()), latents.detach().cpu().clone())
@@ -502,11 +538,17 @@ def run_denoise(dit, scheduler, latents, ctx_posi, ctx_nega, *,
     return latents, captured, elapsed
 
 
-def decode_video(pipe, vae, latents, device) -> list:
-    """Decode latents to a list of PIL frames (T)."""
-    video = vae.decode(
+def decode_video(pipe, vae, latents, device, tile_batch_size=None) -> list:
+    """Decode latents to a list of PIL frames (T).
+
+    Uses ``batched_tiled_decode`` (spatial tiles stacked along the batch dim and
+    run in one GPU forward) instead of the sequential ``tiled_decode`` — bit-identical
+    output, much faster. ``tile_batch_size`` caps how many tiles share each forward.
+    """
+    video = vae.batched_tiled_decode(
         latents, device=device,
-        tiled=True, tile_size=(30, 52), tile_stride=(15, 26),
+        tile_size=(30, 52), tile_stride=(15, 26),
+        tile_batch_size=tile_batch_size,
     )
     return pipe.vae_output_to_video(video)
 
@@ -569,7 +611,7 @@ def build_progression_strip(entries, clean_frame, out_path, thumb_h=256):
 
 
 def save_intermediate_viz(out_dir, captured, clean_frame, viz_frame,
-                          dtype, device, pipe, vae):
+                          dtype, device, pipe, vae, tile_batch_size=None):
     """Decode captured intermediate latents and save per-step montages + strip."""
     os.makedirs(out_dir, exist_ok=True)
     clean_path = os.path.join(out_dir, f"clean_frame_{viz_frame:02d}.png")
@@ -579,7 +621,7 @@ def save_intermediate_viz(out_dir, captured, clean_frame, viz_frame,
     for step in sorted(captured):
         t_val, lat = captured[step]
         lat = lat.to(dtype=dtype, device=device)
-        frames = decode_video(pipe, vae, lat, device)
+        frames = decode_video(pipe, vae, lat, device, tile_batch_size=tile_batch_size)
         inter = frames[viz_frame]
 
         frame_path = os.path.join(
@@ -675,12 +717,12 @@ def parse_args():
                         help="Number of prompts to generate per folder (0 = all).")
     parser.add_argument("--num_samples", type=int, default=1,
                         help="Per-prompt sample count. VBench's official protocol uses 5.")
-    parser.add_argument("--videos_root", default="sampled_videos",
+    parser.add_argument("--videos_root", default=os.path.join(OUTPUT_ROOT, "sampled_videos"),
                         help="Root that receives {videos_root}/{model}/{folder}/.")
     parser.add_argument("--model_names", default="original_wan,ras_wan",
                         help="Comma-separated model folder names. Names containing 'ras' "
                              "use the RAS sparse path; others use full inference.")
-    parser.add_argument("--eval_output_root", default="evaluation_results")
+    parser.add_argument("--eval_output_root", default=os.path.join(OUTPUT_ROOT, "evaluation_results"))
     parser.add_argument("--ngpus", type=int, default=1, help="GPUs for vbench evaluate.")
     parser.add_argument("--no_evaluate", action="store_true", help="Skip the vbench step.")
 
@@ -705,7 +747,7 @@ def parse_args():
     # RAS
     parser.add_argument("--ratio", type=float, default=0.25,
                         help="Fraction of tokens processed per sparse step.")
-    parser.add_argument("--num_dense_steps", type=int, default=20,
+    parser.add_argument("--num_dense_steps", type=int, default=10,
                         help="Initial full-update steps that warm the KV caches.")
     parser.add_argument("--extra_dense_steps", default="30,40",
                         help="Comma-separated step indices also forced dense (matches the "
@@ -722,11 +764,15 @@ def parse_args():
                              "intermediate latents.")
     parser.add_argument("--viz_frame", type=int, default=None,
                         help="Frame index shown in the montages (default: middle frame).")
-    parser.add_argument("--viz_dir", default="viz")
-    parser.add_argument("--save_masks", action="store_true",
+    parser.add_argument("--viz_dir", default=os.path.join(OUTPUT_ROOT, "viz"))
+    parser.add_argument("--save_masks", action="store_true", default=True,
                         help="Also save RAS selection masks for visualize_ras_masks.py.")
 
-    # Misc
+    # VAE decode batching
+    parser.add_argument("--tile_batch_size", type=int, default=None,
+                        help="Tiles per batched VAE decode forward (default: all at once). "
+                             "For 480x832 that is 9 tiles. Lower if VRAM is tight; each "
+                             "tile forward holds a ~[1,3,77,416,416] bf16 tensor.")
     parser.add_argument("--keep_vae_on_gpu", action="store_true",
                         help="Leave the VAE on GPU between decodes (faster, more VRAM). "
                              "Default offloads the VAE to CPU between prompts, matching "
@@ -888,7 +934,8 @@ def main():
 
                     # Decode final video (VAE on GPU)
                     vae.to(device)
-                    frames = decode_video(pipe, vae, final, device)
+                    frames = decode_video(pipe, vae, final, device,
+                                          tile_batch_size=args.tile_batch_size)
                     save_video(frames, vid_path, fps=args.fps, quality=5)
 
                     # Intermediate-frame visualization (VAE still on GPU)
@@ -896,7 +943,8 @@ def main():
                         clean = frames[viz_frame]
                         viz_out = os.path.join(args.viz_dir, model, folder, f"prompt_{gidx:03d}")
                         save_intermediate_viz(viz_out, captured, clean, viz_frame,
-                                              dtype, device, pipe, vae)
+                                              dtype, device, pipe, vae,
+                                              tile_batch_size=args.tile_batch_size)
                         print(f"  intermediate-frame montages -> {viz_out}/")
 
                     if args.save_masks and mode == "ras":

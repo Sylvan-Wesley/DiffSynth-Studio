@@ -84,6 +84,27 @@ def scatter_tokens_(
     )
     destination.scatter_(1, scatter_indices, source)
 
+
+def update_noise_cache(
+    previous: Optional[torch.Tensor],
+    selected_patches: torch.Tensor,
+    noise_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Update a full token-noise cache only at the active token positions.
+
+    On the first RAS step there is no cache to preserve, so the complete
+    prediction initializes it. Dense steps select every token and therefore
+    replace the cache in full. Sparse steps scatter only the current active
+    predictions, retaining the earlier values for inactive tokens.
+    """
+    noise_tokens = noise_tokens.detach()
+    if previous is None or selected_patches.shape[1] == noise_tokens.shape[1]:
+        return noise_tokens
+    updated = previous.clone()
+    scatter_tokens_(updated, selected_patches, gather_tokens(noise_tokens, selected_patches))
+    return updated
+
+
 def cache_ready(cache, *keys):
     return (
         cache is not None
@@ -547,13 +568,9 @@ class WanModel(torch.nn.Module):
         else:
             self.control_adapter = None
 
-        # RAS: previous step's predicted noise in token space [B, S, out_dim * prod(patch_size)]
-        # Used by select_region to compute per-token std dev for variance-based selection
-        self._prev_noise_tokens = None
-
         # RAS: token indices selected by the most recent forward() call. Lets the
         # negative CFG branch reuse the positive branch's selection instead of
-        # re-deriving it from a different _prev_noise_tokens.
+        # re-deriving it from a different noise prediction.
         self._last_selected_patches = None
 
         # RAS debug: stores (timestep, mask [B, S], grid_size (f, h, w)) per RAS step
@@ -663,6 +680,7 @@ class WanModel(torch.nn.Module):
                 skip_k: torch.Tensor,
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
+                prev_noise_tokens: Optional[torch.Tensor] = None,
                 use_heuristics: bool = True,
                 k_starvation: float = 0.5,
                 **kwargs,
@@ -675,7 +693,7 @@ class WanModel(torch.nn.Module):
         #   score = importance * exp(k * drop_count)
         # Higher score = more likely to be selected (top-k).
         #
-        # - prev_noise: token-level predicted noise from the PREVIOUS step.
+        # - prev_noise_tokens: token-level guided noise from the PREVIOUS step.
         #   Low within-token variance → semantically meaningful region → select.
         # - drop_count (skip_k): per-token counter of how many steps it was skipped.
         #   exp(k * drop_count) boosts long-skipped tokens to prevent starvation.
@@ -683,11 +701,10 @@ class WanModel(torch.nn.Module):
 
         N = x.shape[1]
         if use_heuristics:
-            prev_noise = self._prev_noise_tokens
-            if prev_noise is not None:
+            if prev_noise_tokens is not None:
                 # Paper metric: std of predicted noise across the token dimension.
                 # Lower std → model is more confident → region is semantically meaningful.
-                std_noise = prev_noise.std(dim=-1)  # [B, S]
+                std_noise = prev_noise_tokens.std(dim=-1)  # [B, S]
                 importance = 1.0 / (std_noise + 1e-6)
             else:
                 # First step: no previous noise available, use L2 norm of latents.
@@ -753,8 +770,17 @@ class WanModel(torch.nn.Module):
                 ratio: float = 0.25,
                 dumb_update: str = "Previous",
                 enable_debug_masks: bool = False,
+                prev_noise_tokens: Optional[torch.Tensor] = None,
+                dumb_noise_tokens: Optional[torch.Tensor] = None,
+                return_noise_tokens: bool = False,
                 **kwargs,
                 ):
+        # RAS dumb-fill source: the previous prediction for THIS branch's
+        # condition (posi branch carries prev-posi, nega carries prev-nega).
+        # Falls back to the selection source so single-cache callers (no-CFG
+        # paths) keep working unchanged.
+        if dumb_noise_tokens is None:
+            dumb_noise_tokens = prev_noise_tokens
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
@@ -780,8 +806,10 @@ class WanModel(torch.nn.Module):
                 region_selected = selected_patches
                 is_full = region_selected.shape[1] == x.shape[1]
             else:
-                region_selected = self.select_region(x, ratio, timestep, context, skip_list, skip_k, clip_feature,
-                                                      y, **kwargs)
+                region_selected = self.select_region(
+                    x, ratio, timestep, context, skip_list, skip_k, clip_feature, y,
+                    prev_noise_tokens=prev_noise_tokens, **kwargs,
+                )
                 self.update_skip_record(skip_list, skip_k, region_selected)
                 is_full = False
 
@@ -810,7 +838,7 @@ class WanModel(torch.nn.Module):
                 x_active = gather_tokens(x, region_selected)
                 # Retain a copy of the DiT input only for the fallback dumb update
                 # (head on raw input) used when no prior prediction exists yet.
-                if self._prev_noise_tokens is None:
+                if dumb_noise_tokens is None:
                     x_dumb = x.clone()
 
             # Store selection mask for visualization if debug mode is enabled
@@ -839,39 +867,41 @@ class WanModel(torch.nn.Module):
 
         # Head projection and output
         if self.training:
-            x = self.head(x, t)
-            x = self.unpatchify(x, (f, h, w))
+            noise_tokens = self.head(x, t)
+            x = self.unpatchify(noise_tokens, (f, h, w))
         elif kv_cache is not None:
             # RAS eval: active tokens get full DiT + head; inactive tokens get a dumb update.
             x_active = self.head(x_active, t)
             if is_full:
                 # Dense step: all tokens processed through DiT, no dumb update needed
-                self._prev_noise_tokens = x_active.detach()
-                x = self.unpatchify(x_active, (f, h, w))
+                # A dense step refreshes every token, so no token should carry a
+                # starvation penalty into the next sparse selection.
+                if skip_k is not None:
+                    skip_k.zero_()
+                noise_tokens = x_active
+                x = self.unpatchify(noise_tokens, (f, h, w))
             else:
                 # Dumb update for inactive tokens; `dumb_update` selects the strategy.
-                # "Previous" carries forward the last real prediction from
-                # `_prev_noise_tokens` (seeded by the dense warm-up steps); "Zero" predicts
+                # "Previous" carries forward this branch's own last prediction from
+                # `dumb_noise_tokens` (its condition-specific cache); "Zero" predicts
                 # no noise for inactive tokens. Raw DiT input is not fed to head() because
                 # head() is trained on the output of the DiT block stack, so applying it to
                 # unprocessed tokens yields garbage predictions.
-                if self._prev_noise_tokens is not None:
+                if dumb_noise_tokens is not None:
                     if dumb_update == "Previous":
-                        x_dumb = self._prev_noise_tokens.clone()            # carry forward
+                        x_dumb = dumb_noise_tokens.clone()                  # carry forward
                     elif dumb_update == "Zero":
-                        x_dumb = torch.zeros_like(self._prev_noise_tokens)  # zero prediction
+                        x_dumb = torch.zeros_like(dumb_noise_tokens)        # zero prediction
                     else:
                         raise ValueError(f"Unknown dumb_update: {dumb_update!r}")
                 else:
                     # Fallback (no prior prediction yet): head on raw DiT input.
                     x_dumb = self.head(x_dumb, t)
                 scatter_tokens_(x_dumb, region_selected, x_active)          # fresh active into x_dumb
-                self._prev_noise_tokens = x_dumb.detach()                   # buffer = full result
-                x = self.unpatchify(x_dumb, (f, h, w))
+                noise_tokens = x_dumb
+                x = self.unpatchify(noise_tokens, (f, h, w))
         else:
             # Full eval (no RAS): all tokens processed through DiT
-            x = self.head(x_active, t)
-            # Store token-level noise for next step's variance-based region selection
-            self._prev_noise_tokens = x.detach()
-            x = self.unpatchify(x, (f, h, w))
-        return x
+            noise_tokens = self.head(x_active, t)
+            x = self.unpatchify(noise_tokens, (f, h, w))
+        return (x, noise_tokens) if return_noise_tokens else x

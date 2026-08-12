@@ -1152,6 +1152,87 @@ class WanVideoVAE(nn.Module):
         return values
 
 
+    def batched_tiled_decode(self, hidden_states, device, tile_size, tile_stride,
+                             tile_batch_size=None):
+        """Tiled VAE decode with the spatial tiles computed in a single batch.
+
+        Same per-tile math as ``tiled_decode`` (causal decoder + feathered blend via
+        ``build_mask``), but stacks all tiles along the batch dim so the GPU runs
+        them concurrently instead of one at a time. ``VideoVAE_.decode`` is
+        batch-agnostic (pure convs, temporal-only causal cache), so the output is
+        bit-identical to the sequential version — only faster.
+
+        ``tile_batch_size`` bounds how many tiles go in each GPU forward (default:
+        all tiles at once). Lower it if VRAM is tight.
+        """
+        _, _, T, H, W = hidden_states.shape
+        size_h, size_w = tile_size
+        stride_h, stride_w = tile_stride
+
+        # Split tasks (same tile grid as tiled_decode)
+        tasks = []
+        for h in range(0, H, stride_h):
+            if (h - stride_h >= 0 and h - stride_h + size_h >= H):
+                continue
+            for w in range(0, W, stride_w):
+                if (w - stride_w >= 0 and w - stride_w + size_w >= W):
+                    continue
+                h_, w_ = h + size_h, w + size_w
+                tasks.append((h, h_, w, w_))
+
+        data_device = "cpu"
+        computation_device = device
+
+        up = self.upsampling_factor
+        out_T = T * 4 - 3
+        weight = torch.zeros((1, 1, out_T, H * up, W * up),
+                             dtype=hidden_states.dtype, device=data_device)
+        values = torch.zeros((1, 3, out_T, H * up, W * up),
+                             dtype=hidden_states.dtype, device=data_device)
+
+        if tile_batch_size is None:
+            tile_batch_size = len(tasks)
+
+        for start in tqdm(range(0, len(tasks), tile_batch_size),
+                          desc="VAE decoding (batched)"):
+            batch_tasks = tasks[start:start + tile_batch_size]
+            # Stack the tile latents into the batch dim; the causal decoder
+            # processes them all in one pass.
+            tile_latents = torch.cat(
+                [hidden_states[:, :, :, h:h_, w:w_] for h, h_, w, w_ in batch_tasks],
+                dim=0,
+            ).to(computation_device)
+            tile_videos = self.model.decode(tile_latents, self.scale).to(data_device)
+
+            for k, (h, h_, w, w_) in enumerate(batch_tasks):
+                mask = self.build_mask(
+                    tile_videos[k:k + 1],
+                    is_bound=(h == 0, h_ >= H, w == 0, w_ >= W),
+                    border_width=((size_h - stride_h) * up,
+                                  (size_w - stride_w) * up),
+                ).to(dtype=hidden_states.dtype, device=data_device)
+
+                target_h = h * up
+                target_w = w * up
+                values[
+                    :,
+                    :,
+                    :,
+                    target_h:target_h + tile_videos.shape[3],
+                    target_w:target_w + tile_videos.shape[4],
+                ] += tile_videos[k:k + 1] * mask
+                weight[
+                    :,
+                    :,
+                    :,
+                    target_h:target_h + tile_videos.shape[3],
+                    target_w:target_w + tile_videos.shape[4],
+                ] += mask
+        values = values / weight
+        values = values.clamp_(-1, 1)
+        return values
+
+
     def tiled_encode(self, video, device, tile_size, tile_stride):
         _, _, T, H, W = video.shape
         size_h, size_w = tile_size

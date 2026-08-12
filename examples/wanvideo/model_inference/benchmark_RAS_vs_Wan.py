@@ -24,7 +24,7 @@ import numpy as np
 from tqdm import tqdm
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-from diffsynth.models.wan_video_dit import set_to_torch_norm
+from diffsynth.models.wan_video_dit import set_to_torch_norm, update_noise_cache
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -142,16 +142,21 @@ if torch.cuda.is_available():
 @torch.no_grad()
 def denoise_step(latents, t, kv_cache_posi, ctx_kv_cache_posi,
                  kv_cache_nega, ctx_kv_cache_nega,
-                 skip_list, skip_k, selected_patches, ratio_val):
-    """One denoising step with CFG. Returns noise_pred and updated latents."""
+                 skip_list, skip_k, selected_patches, ratio_val,
+                 prev_posi_noise_tokens=None, prev_nega_noise_tokens=None,
+                 prev_guided_noise_tokens=None):
+    """Run one denoising step and return the noise plus the next per-condition RAS caches."""
     # Positive branch
-    noise_posi = dit.forward(
+    noise_posi, noise_posi_tokens = dit.forward(
         x=latents, timestep=t, context=ctx_posi,
         kv_cache=kv_cache_posi, ctx_kv_cache=ctx_kv_cache_posi,
         skip_list=skip_list, skip_k=skip_k,
         selected_patches=selected_patches,
         ratio=ratio_val, dumb_update=dumb_update,
         enable_debug_masks=False,
+        prev_noise_tokens=prev_guided_noise_tokens,
+        dumb_noise_tokens=prev_posi_noise_tokens,
+        return_noise_tokens=True,
     )
 
     # Free transient posi activations before nega forward
@@ -165,19 +170,42 @@ def denoise_step(latents, t, kv_cache_posi, ctx_kv_cache_posi,
             dit.get_last_selected_patches()
             if selected_patches is None else selected_patches
         )
-        noise_nega = dit.forward(
+        noise_nega, noise_nega_tokens = dit.forward(
             x=latents, timestep=t, context=ctx_nega,
             kv_cache=kv_cache_nega, ctx_kv_cache=ctx_kv_cache_nega,
             skip_list=skip_list, skip_k=skip_k,
             selected_patches=nega_selected,
             ratio=ratio_val, dumb_update=dumb_update,
             enable_debug_masks=False,
+            prev_noise_tokens=prev_guided_noise_tokens,
+            dumb_noise_tokens=prev_nega_noise_tokens,
+            return_noise_tokens=True,
         )
         noise_pred = noise_nega + cfg_scale * (noise_posi - noise_nega)
+        guided_noise_tokens = noise_nega_tokens + cfg_scale * (
+            noise_posi_tokens - noise_nega_tokens
+        )
+        active_patches = nega_selected
     else:
         noise_pred = noise_posi
+        guided_noise_tokens = noise_posi_tokens
+        active_patches = dit.get_last_selected_patches()
 
-    return noise_pred
+    if kv_cache_posi is not None:
+        # Scatter only the active predictions into each retained cache so
+        # inactive entries keep their prior per-condition values.
+        prev_posi_noise_tokens = update_noise_cache(
+            prev_posi_noise_tokens, active_patches, noise_posi_tokens,
+        )
+        if cfg_scale != 1.0:
+            prev_nega_noise_tokens = update_noise_cache(
+                prev_nega_noise_tokens, active_patches, noise_nega_tokens,
+            )
+        prev_guided_noise_tokens = update_noise_cache(
+            prev_guided_noise_tokens, active_patches, guided_noise_tokens,
+        )
+    return (noise_pred, prev_posi_noise_tokens, prev_nega_noise_tokens,
+            prev_guided_noise_tokens)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -191,8 +219,6 @@ print("=" * 60)
 # Fresh latents
 latents_full = pipe.generate_noise(shape, seed=seed, rand_device="cpu")
 latents_full = latents_full.to(dtype=dtype, device=device)
-dit._prev_noise_tokens = None
-
 dit.eval()
 torch.cuda.synchronize()
 t_start = time.perf_counter()
@@ -201,7 +227,7 @@ for progress_id, timestep in enumerate(tqdm(timesteps, desc="Full")):
     t = timestep.unsqueeze(0).to(dtype=dtype, device=device)
 
     # kv_cache=None → full eval path in WanModel.forward()
-    noise_pred = denoise_step(
+    noise_pred, _, _, _ = denoise_step(
         latents=latents_full, t=t,
         kv_cache_posi=None, ctx_kv_cache_posi=None,
         kv_cache_nega=None, ctx_kv_cache_nega=None,
@@ -229,7 +255,9 @@ print("=" * 60)
 # Fresh latents (identical noise, same seed)
 latents_ras = pipe.generate_noise(shape, seed=seed, rand_device="cpu")
 latents_ras = latents_ras.to(dtype=dtype, device=device)
-dit._prev_noise_tokens = None
+prev_posi_noise_tokens = None
+prev_nega_noise_tokens = None
+prev_guided_noise_tokens = None
 
 # RAS state
 kv_cache_posi  = [{} for _ in range(num_layers)]
@@ -252,12 +280,16 @@ for progress_id, timestep in enumerate(tqdm(timesteps, desc="RAS ")):
     is_dense = progress_id < num_dense_steps
     sel = all_patches if is_dense else None
 
-    noise_pred = denoise_step(
+    (noise_pred, prev_posi_noise_tokens, prev_nega_noise_tokens,
+     prev_guided_noise_tokens) = denoise_step(
         latents=latents_ras, t=t,
         kv_cache_posi=kv_cache_posi, ctx_kv_cache_posi=ctx_kv_cache_posi,
         kv_cache_nega=kv_cache_nega, ctx_kv_cache_nega=ctx_kv_cache_nega,
         skip_list=skip_list, skip_k=skip_k,
         selected_patches=sel, ratio_val=ratio,
+        prev_posi_noise_tokens=prev_posi_noise_tokens,
+        prev_nega_noise_tokens=prev_nega_noise_tokens,
+        prev_guided_noise_tokens=prev_guided_noise_tokens,
     )
 
     latents_ras = scheduler.step(

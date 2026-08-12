@@ -27,7 +27,7 @@ from PIL import Image
 from tqdm import tqdm
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-from diffsynth.models.wan_video_dit import selection_mask_to_grid, set_to_torch_norm
+from diffsynth.models.wan_video_dit import selection_mask_to_grid, set_to_torch_norm, update_noise_cache
 from diffsynth.models.wan_video_dit import FLASH_ATTN_3_AVAILABLE, FLASH_ATTN_2_AVAILABLE, SAGE_ATTN_AVAILABLE
 
 
@@ -52,7 +52,7 @@ width = 832
 
 # RAS
 ratio = 0.25                # fraction of tokens updated per step (1.0 = full, 0.25 = 4x fewer)
-num_dense_steps = 20         # initial steps with full updates to warm KV caches
+num_dense_steps = 10         # initial steps with full updates to warm KV caches
 enable_viz = True           # store per-step selection masks for visualization
 dumb_update = "Previous"
 viz_mask_mode = "per_frame" # how selection masks are saved:
@@ -166,8 +166,15 @@ ctx_kv_cache_nega = [{} for _ in range(num_layers)]
 skip_list = torch.zeros(B, S, device=device)
 skip_k = torch.zeros(B, S, device=device)    # drop counter per token (0 = never skipped)
 
-# Reset previous noise (first step falls back to L2 norm heuristic)
-dit._prev_noise_tokens = None
+# Per-condition token-noise caches, updated only at active regions each step.
+# Each CFG branch's dumb fill carries forward its OWN condition's previous
+# prediction (posi→posi, nega→nega), so `noise_pred = nega + cfg*(posi - nega)`
+# is a genuine guided combination on every token. `prev_guided_noise_tokens`
+# is that CFG combo and drives select_region, so selection follows the
+# scheduler's actual trajectory.
+prev_posi_noise_tokens = None
+prev_nega_noise_tokens = None
+prev_guided_noise_tokens = None
 
 # Pre-compute all-patches index for dense warm-up steps
 all_patches = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
@@ -230,7 +237,7 @@ with torch.inference_mode():
         selected_patches = all_patches if is_dense else None
 
         # --- Positive (conditional) forward ---
-        noise_posi = dit.forward(
+        noise_posi, noise_posi_tokens = dit.forward(
             x=latents,
             timestep=t,
             context=ctx_posi,
@@ -242,6 +249,9 @@ with torch.inference_mode():
             ratio=ratio,
             dumb_update=dumb_update,
             enable_debug_masks=enable_viz,
+            prev_noise_tokens=prev_guided_noise_tokens,
+            dumb_noise_tokens=prev_posi_noise_tokens,
+            return_noise_tokens=True,
         )
 
         # Free transient memory from posi forward before running nega forward.
@@ -254,12 +264,12 @@ with torch.inference_mode():
             # The negative branch must process the SAME tokens as the positive
             # branch. On sparse steps (selected_patches is None) pass the posi
             # selection explicitly; otherwise forward() would re-derive it from
-            # a different _prev_noise_tokens and double-update the skip record.
+            # an independently selected noise map and double-update the skip record.
             nega_selected = (
                 dit.get_last_selected_patches()
                 if selected_patches is None else selected_patches
             )
-            noise_nega = dit.forward(
+            noise_nega, noise_nega_tokens = dit.forward(
                 x=latents,
                 timestep=t,
                 context=ctx_nega,
@@ -269,11 +279,36 @@ with torch.inference_mode():
                 skip_k=skip_k,
                 selected_patches=nega_selected,
                 ratio=ratio,
+                dumb_update=dumb_update,
                 enable_debug_masks=False,   # only record masks for positive branch
+                prev_noise_tokens=prev_guided_noise_tokens,
+                dumb_noise_tokens=prev_nega_noise_tokens,
+                return_noise_tokens=True,
             )
             noise_pred = noise_nega + cfg_scale * (noise_posi - noise_nega)
+            guided_noise_tokens = noise_nega_tokens + cfg_scale * (
+                noise_posi_tokens - noise_nega_tokens
+            )
+            active_patches = nega_selected
         else:
             noise_pred = noise_posi
+            guided_noise_tokens = noise_posi_tokens
+            active_patches = dit.get_last_selected_patches()
+
+        # The caches are RAS state, not per-branch state: scatter only the
+        # active predictions into each retained cache so inactive entries keep
+        # their prior values. `prev_guided_noise_tokens` is the CFG combo of the
+        # two condition caches and drives the next step's selection.
+        prev_posi_noise_tokens = update_noise_cache(
+            prev_posi_noise_tokens, active_patches, noise_posi_tokens,
+        )
+        if cfg_scale != 1.0:
+            prev_nega_noise_tokens = update_noise_cache(
+                prev_nega_noise_tokens, active_patches, noise_nega_tokens,
+            )
+        prev_guided_noise_tokens = update_noise_cache(
+            prev_guided_noise_tokens, active_patches, guided_noise_tokens,
+        )
 
         # --- Scheduler step ---
         latents = scheduler.step(
