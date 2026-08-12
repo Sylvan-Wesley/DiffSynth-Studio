@@ -47,6 +47,7 @@ width = 832
 # RAS settings
 ratio = 0.25
 num_dense_steps = 3
+dumb_update = "Previous"  # "Previous" | "Zero"
 
 # Output
 output_full = "benchmark_full_output.mp4"
@@ -149,7 +150,8 @@ def denoise_step(latents, t, kv_cache_posi, ctx_kv_cache_posi,
         kv_cache=kv_cache_posi, ctx_kv_cache=ctx_kv_cache_posi,
         skip_list=skip_list, skip_k=skip_k,
         selected_patches=selected_patches,
-        ratio=ratio_val, enable_debug_masks=False,
+        ratio=ratio_val, dumb_update=dumb_update,
+        enable_debug_masks=False,
     )
 
     # Free transient posi activations before nega forward
@@ -168,7 +170,8 @@ def denoise_step(latents, t, kv_cache_posi, ctx_kv_cache_posi,
             kv_cache=kv_cache_nega, ctx_kv_cache=ctx_kv_cache_nega,
             skip_list=skip_list, skip_k=skip_k,
             selected_patches=nega_selected,
-            ratio=ratio_val, enable_debug_masks=False,
+            ratio=ratio_val, dumb_update=dumb_update,
+            enable_debug_masks=False,
         )
         noise_pred = noise_nega + cfg_scale * (noise_posi - noise_nega)
     else:

@@ -54,6 +54,7 @@ width = 832
 ratio = 0.25                # fraction of tokens updated per step (1.0 = full, 0.25 = 4x fewer)
 num_dense_steps = 20         # initial steps with full updates to warm KV caches
 enable_viz = True           # store per-step selection masks for visualization
+dumb_update = "Previous"
 viz_mask_mode = "per_frame" # how selection masks are saved:
                             #   "frame_avg"  → one [h, w] map per step (averaged over frames) [default]
                             #   "per_frame"  → one [h, w] map per (step, frame)   mask_step_XX_f_KK_t_...
@@ -239,6 +240,7 @@ with torch.inference_mode():
             skip_k=skip_k,
             selected_patches=selected_patches,
             ratio=ratio,
+            dumb_update=dumb_update,
             enable_debug_masks=enable_viz,
         )
 

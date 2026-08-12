@@ -751,6 +751,7 @@ class WanModel(torch.nn.Module):
                 ctx_kv_cache: list = None,
                 selected_patches: torch.Tensor = None,
                 ratio: float = 0.25,
+                dumb_update: str = "Previous",
                 enable_debug_masks: bool = False,
                 **kwargs,
                 ):
@@ -848,19 +849,24 @@ class WanModel(torch.nn.Module):
                 self._prev_noise_tokens = x_active.detach()
                 x = self.unpatchify(x_active, (f, h, w))
             else:
-                # Dumb update: carry forward the last real prediction for inactive tokens
-                # instead of feeding raw DiT input to head(). head() is trained on the
-                # output of the DiT block stack, so applying it to unprocessed input
-                # tokens yields garbage noise predictions that corrupt inactive regions
-                # on every step. `_prev_noise_tokens` is seeded by the dense warm-up steps.
+                # Dumb update for inactive tokens; `dumb_update` selects the strategy.
+                # "Previous" carries forward the last real prediction from
+                # `_prev_noise_tokens` (seeded by the dense warm-up steps); "Zero" predicts
+                # no noise for inactive tokens. Raw DiT input is not fed to head() because
+                # head() is trained on the output of the DiT block stack, so applying it to
+                # unprocessed tokens yields garbage predictions.
                 if self._prev_noise_tokens is not None:
-                    x_dumb = self._prev_noise_tokens.clone()
+                    if dumb_update == "Previous":
+                        x_dumb = self._prev_noise_tokens.clone()            # carry forward
+                    elif dumb_update == "Zero":
+                        x_dumb = torch.zeros_like(self._prev_noise_tokens)  # zero prediction
+                    else:
+                        raise ValueError(f"Unknown dumb_update: {dumb_update!r}")
                 else:
-                    # Fallback (e.g. no dense warm-up): head on raw DiT input.
+                    # Fallback (no prior prediction yet): head on raw DiT input.
                     x_dumb = self.head(x_dumb, t)
-                scatter_tokens_(x_dumb, region_selected, x_active)
-                # Store token-level noise for next step's variance-based region selection
-                self._prev_noise_tokens = x_dumb.detach()
+                scatter_tokens_(x_dumb, region_selected, x_active)          # fresh active into x_dumb
+                self._prev_noise_tokens = x_dumb.detach()                   # buffer = full result
                 x = self.unpatchify(x_dumb, (f, h, w))
         else:
             # Full eval (no RAS): all tokens processed through DiT
