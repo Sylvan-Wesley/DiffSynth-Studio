@@ -43,7 +43,7 @@ prompt = "纪实摄影风格画面，一只活泼的小狗在绿茵茵的草地�
 
 negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
-num_inference_steps = 50  # official Wan2.1 default
+num_inference_steps = 15  # official Wan2.1 default
 cfg_scale = 5.0
 seed = 0
 num_frames = 81
@@ -52,7 +52,7 @@ width = 832
 
 # RAS
 ratio = 0.25                # fraction of tokens updated per step (1.0 = full, 0.25 = 4x fewer)
-num_dense_steps = 10         # initial steps with full updates to warm KV caches
+num_dense_steps = 3         # initial steps with full updates to warm KV caches
 enable_viz = True           # store per-step selection masks for visualization
 dumb_update = "Previous"
 viz_mask_mode = "per_frame" # how selection masks are saved:
@@ -164,7 +164,7 @@ ctx_kv_cache_nega = [{} for _ in range(num_layers)]
 
 # Starvation prevention: skip_list tracks cumulative skip penalty per token
 skip_list = torch.zeros(B, S, device=device)
-skip_k = torch.zeros(B, S, device=device)    # drop counter per token (0 = never skipped)
+skip_k = torch.zeros(B, S, device=device) - num_inference_steps    # drop counter per token (0 = never skipped)
 
 # Per-condition token-noise caches, updated only at active regions each step.
 # Each CFG branch's dumb fill carries forward its OWN condition's previous
@@ -233,7 +233,7 @@ with torch.inference_mode():
 
         # Dense steps: process ALL tokens to warm KV caches.
         # Sparse steps: let model auto-select which tokens to process.
-        is_dense = progress_id < num_dense_steps or progress_id == 30 or progress_id == 40
+        is_dense = progress_id < num_dense_steps or progress_id == 10 or progress_id == 13
         selected_patches = all_patches if is_dense else None
 
         # --- Positive (conditional) forward ---
