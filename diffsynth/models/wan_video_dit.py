@@ -112,6 +112,39 @@ def cache_ready(cache, *keys):
     )
 
 
+def validate_flow_magnitudes(flow: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Validate/prepare the static flow-magnitude ranking tensor.
+
+    Flow-guided RAS ranks tokens by the optical-flow magnitude pooled from a
+    dense reference video. Expected shape is [B, S] with B == x.shape[0] and
+    S == x.shape[1] (the token count AFTER patchify). The tensor is moved onto
+    x's device and returned; violations raise ``ValueError``.
+
+    Args:
+        flow: Optional motion-magnitude tensor [B, S] (floats, non-negative).
+        x: The patched DiT input [B, S, D] the flow will rank against.
+
+    Returns:
+        ``flow`` relocated to x.device (shape validated).
+    """
+    if flow.ndim != 2:
+        raise ValueError(
+            f"flow_magnitudes must be [B, S], got shape {tuple(flow.shape)}"
+        )
+    if flow.shape[0] != x.shape[0] or flow.shape[1] != x.shape[1]:
+        raise ValueError(
+            f"flow_magnitudes shape {tuple(flow.shape)} does not match "
+            f"[B={x.shape[0]}, S={x.shape[1]}] (token count after patchify)"
+        )
+    if flow.device != x.device:
+        flow = flow.to(device=x.device)
+    if not torch.isfinite(flow).all():
+        raise ValueError("flow_magnitudes must be finite")
+    if (flow < 0).any():
+        raise ValueError("flow_magnitudes must be non-negative")
+    return flow
+
+
 def selection_mask_to_grid(mask: torch.Tensor, grid_size: tuple) -> torch.Tensor:
     """Convert a [B, f*h*w] bool selection mask to a [B, 1, f, h, w] float grid.
 
@@ -681,6 +714,7 @@ class WanModel(torch.nn.Module):
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
                 prev_noise_tokens: Optional[torch.Tensor] = None,
+                flow_magnitudes: Optional[torch.Tensor] = None,
                 use_heuristics: bool = True,
                 k_starvation: float = 0.5,
                 **kwargs,
@@ -695,13 +729,23 @@ class WanModel(torch.nn.Module):
         #
         # - prev_noise_tokens: token-level guided noise from the PREVIOUS step.
         #   Low within-token variance → semantically meaningful region → select.
+        # - flow_magnitudes: OPTIONAL static per-token motion magnitude pooled
+        #   from the RAFT flow of a dense reference video (flow-guided mode).
+        #   When supplied it REPLACES the previous-noise metric:
+        #   importance = max(flow_magnitude, 1e-6). The floor keeps the
+        #   multiplicative starvation term exp(k*drop_count) effective for
+        #   zero-motion patches, so static regions can still be serviced after
+        #   enough skipped steps.
         # - drop_count (skip_k): per-token counter of how many steps it was skipped.
         #   exp(k * drop_count) boosts long-skipped tokens to prevent starvation.
         # - Falls back to L2 norm of current latents on the first step (no prev noise).
 
         N = x.shape[1]
         if use_heuristics:
-            if prev_noise_tokens is not None:
+            if flow_magnitudes is not None:
+                # Flow-guided ranking: higher motion magnitude = higher priority.
+                importance = torch.clamp(flow_magnitudes, min=1e-6)
+            elif prev_noise_tokens is not None:
                 # Paper metric: std of predicted noise across the token dimension.
                 # Lower std → model is more confident → region is semantically meaningful.
                 std_noise = prev_noise_tokens.std(dim=-1)  # [B, S]
@@ -726,14 +770,16 @@ class WanModel(torch.nn.Module):
         ):
         """Update per-token drop counters for starvation prevention.
 
-        skip_k: per-token drop count [B, S]. Selected tokens reset to 0;
-                all tokens increment by 1 (unselected accumulate, selected → 1).
+        True starvation accounting: only tokens that were NOT serviced this step
+        accumulate a drop count. Selected tokens reset to 0; unselected tokens
+        increment by 1. Call this ONCE per step from the positive CFG branch only;
+        the negative branch reuses the exact positive selection and must never
+        call this again (it would double-count every drop).
         """
         B = skip_k.shape[0]
-        # Reset drop count for selected tokens
-        skip_k[torch.arange(0, B, device=skip_k.device), selected_patches] = 0
-        # Increment all: unselected accumulate, selected go to 1
+        # Tick every token up first, then reset exactly the serviced tokens.
         skip_k.add_(1)
+        skip_k[torch.arange(0, B, device=skip_k.device), selected_patches] = 0
 
     def get_selection_masks(self):
         """Return list of (timestep, binary_mask [B, S], grid_size (f, h, w)) for each RAS step.
@@ -771,7 +817,9 @@ class WanModel(torch.nn.Module):
                 dumb_update: str = "Previous",
                 enable_debug_masks: bool = False,
                 prev_noise_tokens: Optional[torch.Tensor] = None,
+                flow_magnitudes: Optional[torch.Tensor] = None,
                 dumb_noise_tokens: Optional[torch.Tensor] = None,
+                starvation_scale: float = 0.5,
                 return_noise_tokens: bool = False,
                 **kwargs,
                 ):
@@ -806,9 +854,14 @@ class WanModel(torch.nn.Module):
                 region_selected = selected_patches
                 is_full = region_selected.shape[1] == x.shape[1]
             else:
+                if flow_magnitudes is not None:
+                    flow_magnitudes = validate_flow_magnitudes(flow_magnitudes, x)
                 region_selected = self.select_region(
                     x, ratio, timestep, context, skip_list, skip_k, clip_feature, y,
-                    prev_noise_tokens=prev_noise_tokens, **kwargs,
+                    prev_noise_tokens=prev_noise_tokens,
+                    flow_magnitudes=flow_magnitudes,
+                    k_starvation=starvation_scale,
+                    **kwargs,
                 )
                 self.update_skip_record(skip_list, skip_k, region_selected)
                 is_full = False

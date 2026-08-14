@@ -122,3 +122,87 @@ Model:
   `dumb_update="Previous"`, `num_inference_steps=50`, `cfg_scale=5.0`, 81 frames @ 480×832.
 - `python examples/wanvideo/model_inference/RAS-Wan2.1-T2V-1.3B.py` → `ras_output.mp4`; with
   `enable_viz=True`, per-step selection masks under `ras_masks/` (format via `viz_mask_mode`).
+
+---
+
+## Flow-guided RAS experiment (branch `ras-flow-bootstrap`)
+
+Training-free acceleration whose sparse selection is driven by **static optical-flow magnitude**
+instead of the previous-noise variance metric. Flow is estimated ONCE from a fully generated dense
+reference video and held fixed during the RAS pass; only the starvation counts evolve.
+
+### Files
+- `examples/wanvideo/model_inference/RAS-Wan2.1-T2V-1.3B-OpticalFlow.py` — the two-pass experiment.
+  Module-level pure helpers (`spatial_pool_to_patch_grid`, `temporal_group_flow`, `flow_grid_to_b_s`,
+  `estimate_flow_magnitudes`) are importable for unit tests; all model work lives in `main()` under
+  `if __name__ == "__main__":`. The existing `RAS-Wan2.1-T2V-1.3B.py` is untouched — it stays the
+  non-flow baseline.
+- `diffsynth/models/wan_video_dit.py` — same file as the base RAS machinery; adds OPTIONAL flow-ranking
+  inputs (see below). RAFT is never a model-layer dependency.
+- `tests/test_ras_flow_bootstrap.py` — CPU unit tests (plain-assert runner, no pytest).
+
+### Two-pass lifecycle
+1. **Initial latents** — `pipe.generate_noise(shape, seed, rand_device="cpu")` ONCE; the dense pass and
+   the RAS pass each clone it (`initial_latents.clone()`).
+2. **Pass 1 — dense reference** — ordinary full-Wan CFG denoising for ALL scheduler steps with
+   `kv_cache=None` (`noise_pred = nega + cfg*(posi - nega)`), decoded and saved to
+   `wan_flow_reference.mp4`. This video is the flow source AND the visual baseline.
+3. **Flow** — RAFT-Small (torchvision) over every adjacent decoded RGB frame pair → per-pixel magnitude
+   `sqrt(u²+v²)` → spatial avg-pool to the DiT patch grid → temporal aggregation to the latent-frame
+   grid (see mapping below) → flatten to `[B, S]` frame-major (same order as `WanModel.patchify`).
+4. **Pass 2 — flow-guided RAS** — fresh KV/noise caches, skip counters, debug masks; `latents =
+   initial_latents.clone()`; dense warm-up steps seed the KV caches, then every sparse step passes
+   `flow_magnitudes` + `starvation_scale` to `WanModel.forward`. Decoded to `ras_flow_ranked.mp4`.
+
+### Score definition (flow-guided sparse steps)
+```
+score_i = max(flow_magnitude_i, 1e-6) * exp(starvation_scale * starvation_count_i)
+```
+selects the `ceil(ratio * S)` highest-scoring tokens. The `1e-6` magnitude floor keeps the
+multiplicative starvation term effective for zero-motion patches — without it a static region would
+score 0 forever and starve regardless of skip count.
+
+### Latent/RGB temporal mapping (causal Wan decoder)
+Wan's VAE decoder is causal with `T_RGB = 4*T_latent - 3`. Flow pairs map to latent frames as:
+- latent frame 0 ← flow pair 0;
+- latent frame k ≥ 1 ← flow pairs `[4k-3, 4k]` (four pairs each);
+- the final partial group is averaged normally (mean over the remaining pairs).
+
+Spatial pooling uses `F.adaptive_avg_pool2d` to `(latent_h//patch_size[1], latent_w//patch_size[2])`, so
+it is robust to the exact `H/W ÷ 16` divisibility. RAFT inputs must have H,W divisible by 8.
+
+### Model hook — `wan_video_dit.py`
+- `validate_flow_magnitudes(flow, x)` (module helper): enforces `[B, S]` (S = token count AFTER
+  patchify), moves onto `x.device`, requires finite + non-negative, else `ValueError`.
+- `select_region(..., flow_magnitudes=None)`: when supplied, `importance = clamp(flow_magnitudes, min=1e-6)`
+  replaces the prev-noise variance metric; the prev-noise fallback and first-step L2-norm path are
+  unchanged, so existing callers (no flow tensor) behave identically.
+- `forward(..., flow_magnitudes=None, starvation_scale=0.5)`: validates flow in the auto-select branch
+  and threads both into `select_region` (`starvation_scale` → existing `k_starvation`).
+- `update_skip_record` now uses **true starvation accounting**: `skip_k.add_(1)` then zero only the
+  selected tokens — selected → 0, unselected → +1/step. (Old code zeroed-then-incremented, leaving
+  selected tokens at 1.) This is a global change to the shared function and applies to the non-flow
+  path too. Called ONCE per step from the positive CFG branch; the negative branch reuses the exact
+  positive selection. Dense all-token updates zero `skip_k` in `forward` (every patch serviced).
+
+### RAFT weight-download behavior
+`raft_small(weights=Raft_Small_Weights.DEFAULT)` (== `C_T_V2`) downloads ~4 MB on first use from
+download.pytorch.org. Run in FP32/`.eval()`/`torch.inference_mode()`. The torchvision model does NOT
+self-normalize — apply `Raft_Small_Weights.DEFAULT.transforms()` (maps [0,1] → [-1,1]) before each
+pair batch. Take `flows[-1]` (final of the 12 internal updates).
+
+### GPU-memory / offload sequence (79 GB box)
+1. Encode prompts (T5 on GPU) → move `text_encoder` + `vae` (+ image_encoder/motion_controller) to CPU.
+2. Dense reference pass (DiT only on GPU) → move VAE back to GPU → decode → save reference → keep the
+   RGB frames as float32 [0,1] numpy arrays.
+3. Move VAE back to CPU; load RAFT-Small on GPU (tiny); estimate flow over all pairs in `raft_microbatch`
+   microbatches, freeing per-microbatch temporaries.
+4. `del` reference frames + RAFT model, `torch.cuda.empty_cache()` + `synchronize()`.
+5. RAS pass (DiT + flow magnitudes on GPU) → move VAE back → decode `ras_flow_ranked.mp4`.
+
+### Running
+- `python examples/wanvideo/model_inference/RAS-Wan2.1-T2V-1.3B-OpticalFlow.py` → `wan_flow_reference.mp4`
+  + `ras_flow_ranked.mp4`.
+- `--smoke`: 17 frames, 64×128, 3 steps, 1 dense step, `vae_tiled=False` — prints RAFT flow shape,
+  initial-latent equality assertion, per-step selected-token counts, and both output paths.
+- CPU unit tests: `python tests/test_ras_flow_bootstrap.py`.
