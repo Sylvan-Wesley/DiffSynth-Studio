@@ -24,6 +24,12 @@ Usage:
     python RAS-Wan2.1-T2V-1.3B-OpticalFlow.py [--smoke] [--ratio 0.25]
            [--num_dense_steps 10] [--starvation_scale 1.0] [--raft_microbatch 4]
            [--dense_output wan_flow_reference.mp4] [--ras_output ras_flow_ranked.mp4]
+           [--enable_viz/--no-enable_viz] [--viz_mask_mode frame_avg|per_frame|full_grid]
+           [--viz_output_dir ras_masks_flow]
+
+    With ``--enable_viz`` (default), per-step binary selection masks are saved as
+    ``.npy`` arrays exactly like RAS-Wan2.1-T2V-1.3B.py (via ``get_selection_masks``
+    + ``selection_mask_to_grid``), into ``--viz_output_dir``.
 
 RAFT pretrained weights (Raft_Small_Weights.DEFAULT, ~4 MB) download on first use from
 download.pytorch.org. The module-level helper functions are importable for unit tests; no
@@ -32,6 +38,7 @@ models are loaded at import time (see the ``__main__`` guard).
 
 import argparse
 import math
+import os
 
 import numpy as np
 import torch
@@ -43,6 +50,7 @@ from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.models.wan_video_dit import (
     set_to_torch_norm,
     update_noise_cache,
+    selection_mask_to_grid,
     FLASH_ATTN_3_AVAILABLE,
     FLASH_ATTN_2_AVAILABLE,
     SAGE_ATTN_AVAILABLE,
@@ -67,7 +75,7 @@ prompt = "纪实摄影风格画面，一只活泼的小狗在绿茵茵的草地�
 
 negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
-num_inference_steps = 10  # official Wan2.1 default
+num_inference_steps = 15  # official Wan2.1 default
 cfg_scale = 5.0
 seed = 0
 num_frames = 81
@@ -91,6 +99,14 @@ vae_tile_stride = (15, 26)
 
 # RAS dumb update mode (must match the non-flow baseline script)
 DUMB_UPDATE = "Previous"
+
+# Selection-mask saving (mirrors RAS-Wan2.1-T2V-1.3B.py)
+enable_viz = True           # store per-step binary selection masks
+viz_mask_mode = "per_frame"  # how selection masks are saved:
+                            #   "frame_avg"  → one [h, w] map per step (averaged over frames)
+                            #   "per_frame"  → one [h, w] map per (step, frame)   mask_step_XX_f_KK_t_...
+                            #   "full_grid"  → one [f, h, w] grid per step        mask_step_XX_f_all_t_...
+viz_output_dir = "ras_masks_flow"  # directory for mask arrays
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -223,6 +239,11 @@ def parse_args():
     parser.add_argument("--width", type=int, default=width)
     parser.add_argument("--dense_output", type=str, default=dense_output_path)
     parser.add_argument("--ras_output", type=str, default=ras_output_path)
+    parser.add_argument("--enable_viz", action=argparse.BooleanOptionalAction, default=enable_viz,
+                        help="store per-step binary selection masks (--no-enable_viz to disable)")
+    parser.add_argument("--viz_mask_mode", type=str, default=viz_mask_mode,
+                        choices=["frame_avg", "per_frame", "full_grid"])
+    parser.add_argument("--viz_output_dir", type=str, default=viz_output_dir)
     parser.add_argument("--smoke", action="store_true",
                         help="reduced settings for a quick GPU smoke test (17 frames, 64x128, 3 steps)")
     args = parser.parse_args()
@@ -419,7 +440,7 @@ def main():
 
             # Dense warm-up steps process ALL tokens to seed per-layer KV caches;
             # sparse steps let flow-guided select_region pick the tokens.
-            is_dense = progress_id < args.num_dense_steps
+            is_dense = progress_id < args.num_dense_steps or progress_id == 10 or progress_id == 13
             selected_patches = all_patches if is_dense else None
 
             # --- Positive (conditional) forward: flow-guided selection ---
@@ -434,6 +455,7 @@ def main():
                 selected_patches=selected_patches,
                 ratio=args.ratio,
                 dumb_update=DUMB_UPDATE,
+                enable_debug_masks=args.enable_viz,   # record per-step masks only once (positive branch)
                 prev_noise_tokens=prev_guided_noise_tokens,
                 dumb_noise_tokens=prev_posi_noise_tokens,
                 flow_magnitudes=flow_magnitudes,
@@ -461,6 +483,7 @@ def main():
                     selected_patches=nega_selected,
                     ratio=args.ratio,
                     dumb_update=DUMB_UPDATE,
+                    enable_debug_masks=False,   # only record masks for positive branch
                     prev_noise_tokens=prev_guided_noise_tokens,
                     dumb_noise_tokens=prev_nega_noise_tokens,
                     return_noise_tokens=True,
@@ -505,6 +528,46 @@ def main():
     video_frames = pipe.vae_output_to_video(video_tensor)
     save_video(video_frames, args.ras_output, fps=15, quality=5)
     print(f"Flow-guided RAS video saved: {args.ras_output}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Save binary selection masks (mirrors RAS-Wan2.1-T2V-1.3B.py)
+    # ═══════════════════════════════════════════════════════════
+
+    if args.enable_viz:
+        print("\nSaving selection masks...")
+        masks = dit.get_selection_masks()
+        print(f"  Recorded {len(masks)} per-step masks")
+
+        # Each mask entry: (timestep_value, mask_tensor [B, S], grid_size (f, h, w))
+        for idx, (t_val, mask, (f, h, w)) in enumerate(masks):
+            # Convert [B, S] bool mask → [B, 1, f, h, w] float spatial grid
+            grid = selection_mask_to_grid(mask, (f, h, w))
+            frac_selected = mask.float().mean().item()
+            print(f"  Step {idx:2d} (t={t_val:6.1f}): "
+                  f"{frac_selected*100:4.1f}% tokens selected  "
+                  f"grid shape={list(grid.shape)}  "
+                  f"grid_size=({f},{h},{w})")
+
+        os.makedirs(args.viz_output_dir, exist_ok=True)
+        for idx, (t_val, mask, (f, h, w)) in enumerate(masks):
+            grid = selection_mask_to_grid(mask, (f, h, w))   # [1, 1, f, h, w]
+            grid_f = grid[0, 0]                              # [f, h, w] in patch space
+            if args.viz_mask_mode == "frame_avg":
+                # Average over frames for a summary frame mask
+                frame_mask = grid_f.mean(dim=0).cpu().numpy()  # [h, w]
+                np.save(f"{args.viz_output_dir}/mask_step_{idx:02d}_t_{t_val:.0f}.npy", frame_mask)
+            elif args.viz_mask_mode == "per_frame":
+                for k in range(f):
+                    fm = grid_f[k].cpu().numpy()              # [h, w] for frame k
+                    np.save(f"{args.viz_output_dir}/mask_step_{idx:02d}_f_{k:02d}_t_{t_val:.0f}.npy", fm)
+            elif args.viz_mask_mode == "full_grid":
+                np.save(f"{args.viz_output_dir}/mask_step_{idx:02d}_f_all_t_{t_val:.0f}.npy",
+                        grid_f.cpu().numpy())                 # [f, h, w]
+            else:
+                raise ValueError(f"Unknown viz_mask_mode: {args.viz_mask_mode!r}")
+
+        print(f"  Mask arrays saved to: {args.viz_output_dir}/")
+        print(f"  To visualize as heatmap overlay, upsample each {h}×{w} mask to {height}×{width}")
 
     print("\nDone. Compare:")
     print(f"  dense reference : {args.dense_output}")
