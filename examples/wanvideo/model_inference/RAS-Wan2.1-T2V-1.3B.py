@@ -249,6 +249,7 @@ with torch.inference_mode():
             ratio=ratio,
             dumb_update=dumb_update,
             enable_debug_masks=enable_viz,
+            use_heuristics="prev_noise",
             prev_noise_tokens=prev_guided_noise_tokens,
             dumb_noise_tokens=prev_posi_noise_tokens,
             return_noise_tokens=True,

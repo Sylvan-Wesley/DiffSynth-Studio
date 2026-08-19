@@ -456,6 +456,7 @@ def main():
                 ratio=args.ratio,
                 dumb_update=DUMB_UPDATE,
                 enable_debug_masks=args.enable_viz,   # record per-step masks only once (positive branch)
+                use_heuristics="flow",
                 prev_noise_tokens=prev_guided_noise_tokens,
                 dumb_noise_tokens=prev_posi_noise_tokens,
                 flow_magnitudes=flow_magnitudes,

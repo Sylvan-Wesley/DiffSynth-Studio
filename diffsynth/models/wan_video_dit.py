@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
 from ..core.gradient import gradient_checkpoint_forward
@@ -715,7 +715,7 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 prev_noise_tokens: Optional[torch.Tensor] = None,
                 flow_magnitudes: Optional[torch.Tensor] = None,
-                use_heuristics: bool = True,
+                use_heuristics: Union[str, dict, None] = "prev_noise",
                 k_starvation: float = 0.5,
                 **kwargs,
                 ):
@@ -727,41 +727,70 @@ class WanModel(torch.nn.Module):
         #   score = importance * exp(k * drop_count)
         # Higher score = more likely to be selected (top-k).
         #
-        # - prev_noise_tokens: token-level guided noise from the PREVIOUS step.
-        #   Low within-token variance → semantically meaningful region → select.
-        # - flow_magnitudes: OPTIONAL static per-token motion magnitude pooled
-        #   from the RAFT flow of a dense reference video (flow-guided mode).
-        #   When supplied it REPLACES the previous-noise metric:
-        #   importance = max(flow_magnitude, 1e-6). The floor keeps the
-        #   multiplicative starvation term exp(k*drop_count) effective for
-        #   zero-motion patches, so static regions can still be serviced after
-        #   enough skipped steps.
-        # - drop_count (skip_k): per-token counter of how many steps it was skipped.
+        # The selection heuristic is chosen EXPLICITLY via `use_heuristics`
+        # (a string, or a dict whose `name` key holds the string); it is never
+        # inferred from which tensors happen to be non-None.
+        #
+        # - "flow":         flow_magnitudes-driven ranking,
+        #                   importance = max(flow_magnitude, 1e-6). The floor
+        #                   keeps the multiplicative starvation term
+        #                   exp(k*drop_count) effective for zero-motion patches,
+        #                   so static regions can still be serviced after enough
+        #                   skipped steps. Requires flow_magnitudes.
+        # - "prev_noise":   token-level guided noise from the PREVIOUS step.
+        #                   Low within-token variance → semantically meaningful
+        #                   region → select. Requires prev_noise_tokens.
+        # - "l2":           L2 norm of current latents (first step: no prev
+        #                   noise available).
+        # - None:           no heuristic (raises NotImplementedError).
+        #
+        # drop_count (skip_k): per-token counter of how many steps it was skipped.
         #   exp(k * drop_count) boosts long-skipped tokens to prevent starvation.
-        # - Falls back to L2 norm of current latents on the first step (no prev noise).
 
         N = x.shape[1]
-        if use_heuristics:
-            if flow_magnitudes is not None:
-                # Flow-guided ranking: higher motion magnitude = higher priority.
-                importance = torch.clamp(flow_magnitudes, min=1e-6)
-            elif prev_noise_tokens is not None:
-                # Paper metric: std of predicted noise across the token dimension.
-                # Lower std → model is more confident → region is semantically meaningful.
-                std_noise = prev_noise_tokens.std(dim=-1)  # [B, S]
-                importance = 1.0 / (std_noise + 1e-6)
-            else:
-                # First step: no previous noise available, use L2 norm of latents.
-                importance = (x ** 2).sum(dim=-1)
-
-            # Starvation prevention: boost tokens that have been skipped many times.
-            # skip_k stores the per-token drop count (incremented each step,
-            # reset for selected tokens).
-            score = importance * torch.exp(k_starvation * skip_k)
-            selected_patches = score.topk(min(N, math.ceil(N * ratio)), dim=-1).indices
-            return selected_patches
+        # Resolve the heuristic name: a dict must carry the selector under `name`.
+        # A dict may also override k_starvation (per-heuristic parameter).
+        if isinstance(use_heuristics, dict):
+            method = use_heuristics.get("name")
+            if not isinstance(method, str):
+                raise ValueError(
+                    f"use_heuristics dict requires a 'name' key holding a heuristic "
+                    f"string, got {use_heuristics!r}"
+                )
+            if "k_starvation" in use_heuristics:
+                k_starvation = use_heuristics["k_starvation"]
         else:
+            method = use_heuristics
+
+        if method == "flow":
+            # Flow-guided ranking: higher motion magnitude = higher priority.
+            if flow_magnitudes is None:
+                raise ValueError("use_heuristics='flow' requires flow_magnitudes (flow-guided RAS)")
+            importance = torch.clamp(flow_magnitudes, min=1e-6)
+        elif method == "prev_noise":
+            # Paper metric: std of predicted noise across the token dimension.
+            # Lower std → model is more confident → region is semantically meaningful.
+            if prev_noise_tokens is None:
+                raise ValueError("use_heuristics='prev_noise' requires prev_noise_tokens")
+            std_noise = prev_noise_tokens.std(dim=-1)  # [B, S]
+            importance = 1.0 / (std_noise + 1e-6)
+        elif method == "l2":
+            # First step: no previous noise available, use L2 norm of latents.
+            importance = (x ** 2).sum(dim=-1)
+        elif method is None:
             raise NotImplementedError
+        else:
+            raise ValueError(
+                f"Unknown use_heuristics {method!r}; expected one of "
+                f"'flow', 'prev_noise', 'l2'"
+            )
+
+        # Starvation prevention: boost tokens that have been skipped many times.
+        # skip_k stores the per-token drop count (incremented each step,
+        # reset for selected tokens).
+        score = importance * torch.exp(k_starvation * skip_k)
+        selected_patches = score.topk(min(N, math.ceil(N * ratio)), dim=-1).indices
+        return selected_patches
 
     def update_skip_record(self,
             skip_list: torch.Tensor,
@@ -820,6 +849,7 @@ class WanModel(torch.nn.Module):
                 flow_magnitudes: Optional[torch.Tensor] = None,
                 dumb_noise_tokens: Optional[torch.Tensor] = None,
                 starvation_scale: float = 0.5,
+                use_heuristics: Union[str, dict, None] = "prev_noise",
                 return_noise_tokens: bool = False,
                 **kwargs,
                 ):
@@ -860,6 +890,7 @@ class WanModel(torch.nn.Module):
                     x, ratio, timestep, context, skip_list, skip_k, clip_feature, y,
                     prev_noise_tokens=prev_noise_tokens,
                     flow_magnitudes=flow_magnitudes,
+                    use_heuristics=use_heuristics,
                     k_starvation=starvation_scale,
                     **kwargs,
                 )
