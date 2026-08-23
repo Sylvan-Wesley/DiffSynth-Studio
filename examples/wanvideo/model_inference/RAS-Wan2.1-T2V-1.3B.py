@@ -55,6 +55,25 @@ ratio = 0.25                # fraction of tokens updated per step (1.0 = full, 0
 num_dense_steps = 3         # initial steps with full updates to warm KV caches
 enable_viz = True           # store per-step selection masks for visualization
 dumb_update = "Previous"
+
+# MotionCache (SkyReels-V2 motion-aware token selection; Xu et al. 2026). Toggles
+# the heuristic passed to select_region. Dict keys: weight_norm_mode ("mean"
+# default, SkyReels), weight_floor (max_rescale only), mc_phase1_steps
+# (uniform-weight warm-up, SkyReels token_phase1_update_count).
+use_motion_cache = False            # set True to enable MotionCache selection
+motion_cache_weight_norm_mode = "mean"   # "mean" | "max" | "max_rescale" (SkyReels default)
+motion_cache_weight_floor = 0.3          # max_rescale floor (SkyReels value)
+motion_cache_phase1_steps = 3            # uniform-weight warm-up steps before motion weights
+use_heuristics = (
+    {
+        "name": "MotionCache",
+        "weight_norm_mode": motion_cache_weight_norm_mode,
+        "weight_floor": motion_cache_weight_floor,
+        "mc_phase1_steps": motion_cache_phase1_steps,
+    }
+    if use_motion_cache else "prev_noise"
+)
+
 viz_mask_mode = "per_frame" # how selection masks are saved:
                             #   "frame_avg"  → one [h, w] map per step (averaged over frames) [default]
                             #   "per_frame"  → one [h, w] map per (step, frame)   mask_step_XX_f_KK_t_...
@@ -218,6 +237,14 @@ if torch.cuda.is_available():
 dit.eval()
 dit.clear_selection_masks()
 
+# MotionCache per-token accumulator (Eq 12): zeros [B, S] before the loop.
+# Re-init per chunk if this loop ever becomes multi-chunk. float32 keeps the
+# accumulation/precision stable across the denoising schedule.
+if use_motion_cache:
+    dit.A = torch.zeros(B, S, device=device)
+    dit._prev_noise_tokens = None
+    dit._mc_phase1_count = 0
+
 print(f"\nDenoising ({num_inference_steps} steps, RAS ratio={ratio}, "
       f"dense warm-up={num_dense_steps})...")
 
@@ -236,6 +263,13 @@ with torch.inference_mode():
         is_dense = progress_id < num_dense_steps or progress_id == 10 or progress_id == 13
         selected_patches = all_patches if is_dense else None
 
+        # MotionCache: on the first sparse step, seed the drift reference from the
+        # last warm-up prediction (SkyReels seeds previous_e0 from the warm-up
+        # forward). Without this the branch would see _prev_noise_tokens == None
+        # and produce a zero drift for the first sparse step.
+        if use_motion_cache and not is_dense and dit._prev_noise_tokens is None:
+            dit._prev_noise_tokens = prev_guided_noise_tokens.detach()
+
         # --- Positive (conditional) forward ---
         noise_posi, noise_posi_tokens = dit.forward(
             x=latents,
@@ -249,7 +283,7 @@ with torch.inference_mode():
             ratio=ratio,
             dumb_update=dumb_update,
             enable_debug_masks=enable_viz,
-            use_heuristics="prev_noise",
+            use_heuristics=use_heuristics,
             prev_noise_tokens=prev_guided_noise_tokens,
             dumb_noise_tokens=prev_posi_noise_tokens,
             return_noise_tokens=True,
@@ -295,6 +329,13 @@ with torch.inference_mode():
             noise_pred = noise_posi
             guided_noise_tokens = noise_posi_tokens
             active_patches = dit.get_last_selected_patches()
+
+        # MotionCache: zero the accumulator at the tokens that just ran a forward
+        # pass (paper Eq 13: "upon selection ... its accumulator A[p] is reset
+        # to 0"). ONCE per step, after the positive branch; the negative branch
+        # reuses the positive selection and must not double-update.
+        if use_motion_cache:
+            dit.reset_motion_accumulator(active_patches)
 
         # The caches are RAS state, not per-branch state: scatter only the
         # active predictions into each retained cache so inactive entries keep

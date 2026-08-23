@@ -609,6 +609,16 @@ class WanModel(torch.nn.Module):
         # RAS debug: stores (timestep, mask [B, S], grid_size (f, h, w)) per RAS step
         self.debug_masks = []
 
+        # MotionCache state. `self.A` is the per-token accumulator [B, N] (SkyReels
+        # phase-2); the RAS script initializes it to zeros before the loop.
+        # `self._prev_noise_tokens` caches the previous step's prediction so the
+        # per-frame drift (relative L1) can be estimated in token space without
+        # threading the previous input latent through the caller.
+        # `self._mc_phase1_count` counts the uniform-weight (phase-1) steps consumed.
+        self.A = None
+        self._prev_noise_tokens = None
+        self._mc_phase1_count = 0
+
         self.prepare_wantodance(in_dim, dim, num_heads, has_image_pos_emb, out_dim, patch_size, eps,
                                 wantodance_enable_music_inject, wantodance_music_inject_layers, wantodance_enable_refimage, wantodance_enable_refface,
                                 wantodance_enable_global, wantodance_enable_dynamicfps, wantodance_enable_unimodel)
@@ -715,10 +725,13 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 prev_noise_tokens: Optional[torch.Tensor] = None,
                 flow_magnitudes: Optional[torch.Tensor] = None,
+                grid: Optional[Tuple[int, int, int]] = None,
                 use_heuristics: Union[str, dict, None] = "prev_noise",
                 k_starvation: float = 0.5,
                 **kwargs,
                 ):
+
+        # Caution: select_region should only be called by the positive branch
 
         # Return a selected_patches object \in [B, N_active]
         #
@@ -742,6 +755,11 @@ class WanModel(torch.nn.Module):
         #                   region → select. Requires prev_noise_tokens.
         # - "l2":           L2 norm of current latents (first step: no prev
         #                   noise available).
+        # - "MotionCache":  SkyReels-V2 motion-aware selection (see branch below):
+        #                   per-frame drift × per-token motion weights accumulate
+        #                   into A, and the top ceil(N*ratio) highest-A tokens are
+        #                   selected. Dict keys: weight_norm_mode, weight_floor,
+        #                   mc_phase1_steps.
         # - None:           no heuristic (raises NotImplementedError).
         #
         # drop_count (skip_k): per-token counter of how many steps it was skipped.
@@ -777,12 +795,101 @@ class WanModel(torch.nn.Module):
         elif method == "l2":
             # First step: no previous noise available, use L2 norm of latents.
             importance = (x ** 2).sum(dim=-1)
+        elif method == "MotionCache":
+            # Motion-aware token selection following the SkyReels-V2 reference
+            # (MotionCache4SkyReels-V2/skyreels_v2_infer/modules/transformer_motion.py:
+            # _compute_weights_from_frame_diff + _compute_per_token_distance), with
+            # top-k selection (RAS override) instead of the reference's A >= threshold.
+            # Only SELECTION is done here; inactive-token reuse is the RAS dumb update.
+            #
+            # Dict form:
+            #   {"name": "MotionCache",
+            #    "weight_norm_mode": "mean" | "max" | "max_rescale",  # default "mean"
+            #    "weight_floor": 0.3,            # only used by "max_rescale"
+            #    "mc_phase1_steps": 3}            # uniform-weight warm-up steps
+            #
+            # Phase-1: for the first mc_phase1_steps sparse steps the motion weights
+            # are 1.0 (SkyReels token_phase1_update_count), so the accumulator builds
+            # history before motion weighting kicks in.
+            if not isinstance(use_heuristics, dict):
+                raise ValueError(
+                    "MotionCache requires a dict use_heuristics with keys "
+                    "'name' (and optional 'weight_norm_mode', 'weight_floor', "
+                    "'mc_phase1_steps')"
+                )
+            if prev_noise_tokens is None:
+                raise ValueError("MotionCache requires prev_noise_tokens")
+            if grid is None:
+                raise ValueError("MotionCache requires grid=(f, h, w) from forward()")
+            assert self.A is not None and self.A.shape == (x.shape[0], x.shape[1]), \
+                "MotionCache needs self.A initialized to zeros [B, N] before the loop"
+
+            weight_norm_mode = use_heuristics.get("weight_norm_mode", "mean")
+            weight_floor = use_heuristics.get("weight_floor", 0.3)
+            mc_phase1_steps = use_heuristics.get("mc_phase1_steps", 3)
+            assert weight_norm_mode in ("mean", "max", "max_rescale"), \
+                f"MotionCache weight_norm_mode must be 'mean'/'max'/'max_rescale', got {weight_norm_mode!r}"
+            assert 0.0 <= weight_floor <= 1.0, \
+                "MotionCache needs weight_floor in [0, 1] (max_rescale floor)"
+
+            B, N, C = prev_noise_tokens.shape
+            f = grid[0]                                  # real temporal frame count
+            hw = N // f
+            if self._mc_phase1_count < mc_phase1_steps:
+                # Phase-1: uniform weights (SkyReels token_phase1_update_count).
+                W = torch.ones(B, N, device=prev_noise_tokens.device)
+                self._mc_phase1_count += 1
+            else:
+                # Motion map W (SkyReels _compute_weights_from_frame_diff): per-spatial-
+                # token relative-L1 inter-frame difference of the previous-step
+                # prediction; frame 0 reuses frame 1; per-frame normalization.
+                toks = prev_noise_tokens.view(B, f, hw, C)   # [B, F, HW, C]
+                prev_f = toks[:, :-1]
+                cur_f = toks[:, 1:]
+                # [F-1, HW] per-spatial-token rel-L1 (mean over batch + channels).
+                frame_diff = (cur_f - prev_f).abs().mean(dim=(0, 3)) \
+                             / (prev_f.abs().mean(dim=(0, 3)) + 1e-8)
+                frame_diff = torch.cat([frame_diff[:1], frame_diff], dim=0)  # frame 0 reuse
+                frame_diff = frame_diff.unsqueeze(0).expand(B, f, hw)        # [B, F, HW]
+                if weight_norm_mode == "max":
+                    fmax = frame_diff.max(dim=2, keepdim=True)[0]
+                    W = frame_diff / (fmax + 1e-8)
+                elif weight_norm_mode == "max_rescale":
+                    fmin = frame_diff.min(dim=2, keepdim=True)[0]
+                    fmax = frame_diff.max(dim=2, keepdim=True)[0]
+                    W = weight_floor + (1 - weight_floor) * \
+                        (frame_diff - fmin) / (fmax - fmin + 1e-8)
+                else:  # "mean"
+                    fmean = frame_diff.mean(dim=2, keepdim=True)
+                    W = frame_diff / (fmean + 1e-8)
+                W = W.reshape(B, N)                      # [B, F, HW] -> [B, N], f-major
+            # Per-frame drift (SkyReels _compute_per_token_distance, no polynomial):
+            # relative-L1 between consecutive steps' predictions, one scalar per frame,
+            # broadcast to the frame's spatial tokens. First step (no cached prev, e.g.
+            # no-CFG paths) -> zeros; the RAS script seeds _prev_noise_tokens from the
+            # last warm-up prediction so the first sparse step gets a real drift.
+            if self._prev_noise_tokens is None:
+                drift = torch.zeros(B, N, device=prev_noise_tokens.device)
+            else:
+                cur = prev_noise_tokens.view(B, f, hw, C)
+                prv = self._prev_noise_tokens.view(B, f, hw, C)
+                diff_f = (cur - prv).abs().mean(dim=(2, 3))          # [B, F]
+                base_f = prv.abs().mean(dim=(2, 3)) + 1e-8           # [B, F]
+                drift = (diff_f / base_f).unsqueeze(2).expand(B, f, hw).reshape(B, N)
+            self._prev_noise_tokens = prev_noise_tokens.detach()
+            # Accumulate (Eq 12) then select top-k by A (RAS override of SkyReels'
+            # A >= threshold). A is reset to 0 at the selected tokens by
+            # reset_motion_accumulator, called once per step by the RAS script.
+            self.A = self.A + W * drift
+            k = min(N, math.ceil(N * ratio))
+            return self.A.topk(k, dim=-1).indices
+
         elif method is None:
             raise NotImplementedError
         else:
             raise ValueError(
                 f"Unknown use_heuristics {method!r}; expected one of "
-                f"'flow', 'prev_noise', 'l2'"
+                f"'flow', 'prev_noise', 'l2', 'MotionCache'"
             )
 
         # Starvation prevention: boost tokens that have been skipped many times.
@@ -809,6 +916,19 @@ class WanModel(torch.nn.Module):
         # Tick every token up first, then reset exactly the serviced tokens.
         skip_k.add_(1)
         skip_k[torch.arange(0, B, device=skip_k.device), selected_patches] = 0
+
+    def reset_motion_accumulator(self, selected_patches):
+        """Zero the MotionCache accumulator at tokens that just ran a forward pass.
+
+        The paper (Eq 13) resets a token's accumulator A[p] to 0 once it is
+        selected and computed. Call ONCE per step from the positive CFG branch
+        (or after `active_patches` is determined in the script), never inside
+        the negative branch -- it reuses the positive selection and must not
+        double-update.
+        """
+        if self.A is None or selected_patches is None:
+            return
+        self.A.scatter_(1, selected_patches, 0.0)
 
     def get_selection_masks(self):
         """Return list of (timestep, binary_mask [B, S], grid_size (f, h, w)) for each RAS step.
@@ -890,6 +1010,7 @@ class WanModel(torch.nn.Module):
                     x, ratio, timestep, context, skip_list, skip_k, clip_feature, y,
                     prev_noise_tokens=prev_noise_tokens,
                     flow_magnitudes=flow_magnitudes,
+                    grid=(f, h, w),
                     use_heuristics=use_heuristics,
                     k_starvation=starvation_scale,
                     **kwargs,
