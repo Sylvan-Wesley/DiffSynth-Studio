@@ -96,6 +96,12 @@ ras_output_path = "ras_flow_ranked.mp4"
 vae_tiled = True
 vae_tile_size = (30, 52)
 vae_tile_stride = (15, 26)
+# VRAM (limited-GPU support; ported from vbench_eval_RAS_vs_Wan.py). Cap the
+# text-encoder seq_len (T5 attention is O(L^2) and the cross-attention KV cache
+# persists across the loop; pipeline default is 512) and bound VAE tiles per
+# forward during decode (None = all tiles at once; accumulation buffers are CPU).
+text_seq_len = 256
+tile_batch_size = 2
 
 # RAS dumb update mode (must match the non-flow baseline script)
 DUMB_UPDATE = "Previous"
@@ -244,6 +250,10 @@ def parse_args():
     parser.add_argument("--viz_mask_mode", type=str, default=viz_mask_mode,
                         choices=["frame_avg", "per_frame", "full_grid"])
     parser.add_argument("--viz_output_dir", type=str, default=viz_output_dir)
+    parser.add_argument("--text_seq_len", type=int, default=text_seq_len,
+                        help="cap tokenizer seq_len (T5 attention is O(L^2); default 512)")
+    parser.add_argument("--tile_batch_size", type=int, default=tile_batch_size,
+                        help="VAE spatial tiles per decode forward; larger = faster, more VRAM")
     parser.add_argument("--smoke", action="store_true",
                         help="reduced settings for a quick GPU smoke test (17 frames, 64x128, 3 steps)")
     args = parser.parse_args()
@@ -264,8 +274,14 @@ def parse_args():
 # Model / pipeline setup (mirrors RAS-Wan2.1-T2V-1.3B.py)
 # ═══════════════════════════════════════════════════════════════
 
+@torch.no_grad()
 def encode_prompt(pipe, prompt: str) -> torch.Tensor:
-    """Encode a text prompt using the pipeline's T5 tokenizer + text encoder."""
+    """Encode a text prompt with the pipeline's T5 tokenizer + text encoder.
+
+    no_grad() is essential here: the T5 encoder is 24 layers of full (non-flash)
+    attention over a seq_len-padded sequence; without it, autograd retains every
+    layer's activations and the encoder alone can consume tens of GB.
+    """
     ids, mask = pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
     ids = ids.to(pipe.device)
     mask = mask.to(pipe.device)
@@ -306,6 +322,12 @@ def main():
         ],
         tokenizer_config=ModelConfig(model_id=model_id, origin_file_pattern="google/umt5-xxl/"),
     )
+
+    # Cap the text-encoder sequence length (T5 attention is O(L^2), and the
+    # cross-attention KV cache persists across the whole denoising loop).
+    if args.text_seq_len != 512:
+        print(f"  text_encoder seq_len: 512 -> {args.text_seq_len}")
+    pipe.tokenizer.seq_len = args.text_seq_len
 
     dit = pipe.dit
     vae = pipe.vae
@@ -371,10 +393,14 @@ def main():
 
     print("Decoding reference video...")
     vae.to(device)
-    video_tensor = vae.decode(
-        latents, device=device,
-        tiled=args.vae_tiled, tile_size=vae_tile_size, tile_stride=vae_tile_stride,
-    )
+    if args.vae_tiled:
+        video_tensor = vae.batched_tiled_decode(
+            latents, device=device,
+            tile_size=vae_tile_size, tile_stride=vae_tile_stride,
+            tile_batch_size=args.tile_batch_size,
+        )
+    else:  # smoke mode: latents too small to tile
+        video_tensor = vae.decode(latents, device=device)
     video_frames = pipe.vae_output_to_video(video_tensor)          # list of PIL Images
     save_video(video_frames, args.dense_output, fps=15, quality=5)
     print(f"Dense reference saved: {args.dense_output}")
@@ -522,10 +548,14 @@ def main():
 
     print("Decoding flow-guided RAS video...")
     vae.to(device)
-    video_tensor = vae.decode(
-        latents, device=device,
-        tiled=args.vae_tiled, tile_size=vae_tile_size, tile_stride=vae_tile_stride,
-    )
+    if args.vae_tiled:
+        video_tensor = vae.batched_tiled_decode(
+            latents, device=device,
+            tile_size=vae_tile_size, tile_stride=vae_tile_stride,
+            tile_batch_size=args.tile_batch_size,
+        )
+    else:  # smoke mode: latents too small to tile
+        video_tensor = vae.decode(latents, device=device)
     video_frames = pipe.vae_output_to_video(video_tensor)
     save_video(video_frames, args.ras_output, fps=15, quality=5)
     print(f"Flow-guided RAS video saved: {args.ras_output}")

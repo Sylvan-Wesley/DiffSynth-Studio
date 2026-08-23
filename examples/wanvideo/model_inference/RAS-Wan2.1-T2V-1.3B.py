@@ -74,6 +74,16 @@ use_heuristics = (
     if use_motion_cache else "prev_noise"
 )
 
+# VRAM (limited-GPU support; ported from vbench_eval_RAS_vs_Wan.py).
+# The pipeline's default text-encoder seq_len is 512. T5 attention is O(L^2)
+# and the cross-attention KV cache is [seq_len x dim] per layer, persisting for
+# the whole denoising loop — capping seq_len cuts both. Prompts here are short,
+# so 256 is safe.
+text_seq_len = 256
+# VAE spatial tiles per forward during decode (None = all tiles at once).
+# Lower if VRAM is tight; the feathered-blend accumulation buffers stay on CPU.
+tile_batch_size = 2
+
 viz_mask_mode = "per_frame" # how selection masks are saved:
                             #   "frame_avg"  → one [h, w] map per step (averaged over frames) [default]
                             #   "per_frame"  → one [h, w] map per (step, frame)   mask_step_XX_f_KK_t_...
@@ -100,6 +110,12 @@ pipe = WanVideoPipeline.from_pretrained(
     tokenizer_config=ModelConfig(model_id=model_id, origin_file_pattern="google/umt5-xxl/"),
 )
 
+# Cap the text-encoder sequence length (T5 attention is O(L^2), and the
+# cross-attention KV cache persists across the whole denoising loop).
+if text_seq_len != 512:
+    print(f"  text_encoder seq_len: 512 -> {text_seq_len}")
+pipe.tokenizer.seq_len = text_seq_len
+
 dit = pipe.dit
 vae = pipe.vae
 scheduler = pipe.scheduler
@@ -121,8 +137,14 @@ print(f"  Attention: FA3={FLASH_ATTN_3_AVAILABLE}, FA2={FLASH_ATTN_2_AVAILABLE},
 # Encode prompts
 # ═══════════════════════════════════════════════════════════════
 
+@torch.no_grad()
 def encode_prompt(pipe, prompt: str) -> torch.Tensor:
-    """Encode a text prompt using the pipeline's T5 tokenizer + text encoder."""
+    """Encode a text prompt with the pipeline's T5 tokenizer + text encoder.
+
+    no_grad() is essential here: the T5 encoder is 24 layers of full (non-flash)
+    attention over a seq_len-padded sequence; without it, autograd retains every
+    layer's activations and the encoder alone can consume tens of GB.
+    """
     ids, mask = pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
     ids = ids.to(pipe.device)
     mask = mask.to(pipe.device)
@@ -133,6 +155,9 @@ def encode_prompt(pipe, prompt: str) -> torch.Tensor:
     return prompt_emb
 
 print("Encoding prompts...")
+if torch.cuda.is_available():
+    print(f"  GPU allocated after model load: "
+          f"{torch.cuda.memory_allocated() / 1024**3:.1f} GiB")
 ctx_posi = encode_prompt(pipe, prompt)       # [1, seq_len, text_dim]
 ctx_nega = encode_prompt(pipe, negative_prompt)
 
@@ -364,11 +389,25 @@ with torch.inference_mode():
 # Decode
 # ═══════════════════════════════════════════════════════════════
 
+# ── Free RAS memory before VAE decode ──────────────────────────
+# The self-attn KV caches are the single biggest RAS VRAM cost (~[1, S, dim]
+# bf16 x K/V x num_layers x 2 CFG branches ≈ ~12 GB at 480x832/81f). Nothing
+# after the loop needs them, the noise caches, the starvation records, or the
+# DiT itself — only `latents` and the saved masks. Releasing these keeps the
+# decode phase light enough to finish on a limited-VRAM card.
+del kv_cache_posi, ctx_kv_cache_posi, kv_cache_nega, ctx_kv_cache_nega
+del skip_list, skip_k, all_patches
+del prev_posi_noise_tokens, prev_nega_noise_tokens, prev_guided_noise_tokens
+dit.to("cpu")
+torch.cuda.empty_cache()
+torch.cuda.synchronize()
+
 print("Decoding video...")
 vae.to(device)
-video = vae.decode(
+video = vae.batched_tiled_decode(
     latents, device=device,
-    tiled=True, tile_size=(30, 52), tile_stride=(15, 26),
+    tile_size=(30, 52), tile_stride=(15, 26),
+    tile_batch_size=tile_batch_size,
 )
 video = pipe.vae_output_to_video(video)
 save_video(video, output_path, fps=15, quality=5)
