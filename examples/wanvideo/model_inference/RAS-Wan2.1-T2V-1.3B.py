@@ -62,7 +62,7 @@ dumb_update = "Previous"
 # (uniform-weight warm-up, SkyReels token_phase1_update_count).
 use_motion_cache = False            # set True to enable MotionCache selection
 motion_cache_weight_norm_mode = "mean"   # "mean" | "max" | "max_rescale" (SkyReels default)
-motion_cache_weight_floor = 0.3          # max_rescale floor (SkyReels value)
+motion_cache_weight_floor = 0.6          # max_rescale floor (SkyReels value)
 motion_cache_phase1_steps = 3            # uniform-weight warm-up steps before motion weights
 use_heuristics = (
     {
@@ -219,6 +219,13 @@ skip_k = torch.zeros(B, S, device=device) - num_inference_steps    # drop counte
 prev_posi_noise_tokens = None
 prev_nega_noise_tokens = None
 prev_guided_noise_tokens = None
+# Full (all-token) CFG-combined predictions, used as the MotionCache drift
+# reference. Unlike prev_guided_noise_tokens (the scattered noise cache, which
+# keeps stale values at inactive tokens), these carry a fresh value for every
+# token every step, so the inter-step drift is non-zero everywhere and no frame
+# is ever locked out of selection.
+prev_guided_full = None
+prev_guided_full_prev = None
 
 # Pre-compute all-patches index for dense warm-up steps
 all_patches = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
@@ -289,11 +296,16 @@ with torch.inference_mode():
         selected_patches = all_patches if is_dense else None
 
         # MotionCache: on the first sparse step, seed the drift reference from the
-        # last warm-up prediction (SkyReels seeds previous_e0 from the warm-up
-        # forward). Without this the branch would see _prev_noise_tokens == None
-        # and produce a zero drift for the first sparse step.
+        # FULL prediction two steps back (SkyReels seeds previous_e0 from the
+        # warm-up forward). prev_noise_tokens is the most recent full prediction
+        # (prev_guided_full); comparing it against the step-before full prediction
+        # gives a non-zero drift for every token. Seeding from the scattered
+        # prev_guided_noise_tokens would make the first sparse step's drift
+        # exactly 0 (current == reference) and lock selection onto the first
+        # frames. Falls back to a zero drift for that one step if the two-step
+        # history is unavailable (e.g. a single dense warm-up step).
         if use_motion_cache and not is_dense and dit._prev_noise_tokens is None:
-            dit._prev_noise_tokens = prev_guided_noise_tokens.detach()
+            dit._prev_noise_tokens = prev_guided_full_prev
 
         # --- Positive (conditional) forward ---
         noise_posi, noise_posi_tokens = dit.forward(
@@ -309,7 +321,9 @@ with torch.inference_mode():
             dumb_update=dumb_update,
             enable_debug_masks=enable_viz,
             use_heuristics=use_heuristics,
-            prev_noise_tokens=prev_guided_noise_tokens,
+            prev_noise_tokens=(
+                prev_guided_full if use_motion_cache else prev_guided_noise_tokens
+            ),
             dumb_noise_tokens=prev_posi_noise_tokens,
             return_noise_tokens=True,
         )
@@ -376,6 +390,11 @@ with torch.inference_mode():
         prev_guided_noise_tokens = update_noise_cache(
             prev_guided_noise_tokens, active_patches, guided_noise_tokens,
         )
+        # Rolling history of FULL predictions for the MotionCache drift: keep
+        # the last two steps' complete guided outputs (incl. dumb-updated
+        # inactive tokens) so the drift compares genuinely consecutive frames.
+        prev_guided_full_prev = prev_guided_full
+        prev_guided_full = guided_noise_tokens.detach()
 
         # --- Scheduler step ---
         latents = scheduler.step(
@@ -398,6 +417,7 @@ with torch.inference_mode():
 del kv_cache_posi, ctx_kv_cache_posi, kv_cache_nega, ctx_kv_cache_nega
 del skip_list, skip_k, all_patches
 del prev_posi_noise_tokens, prev_nega_noise_tokens, prev_guided_noise_tokens
+del prev_guided_full, prev_guided_full_prev
 dit.to("cpu")
 torch.cuda.empty_cache()
 torch.cuda.synchronize()
