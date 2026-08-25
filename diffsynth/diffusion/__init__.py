@@ -4,3 +4,4 @@ from .logger import ModelLogger, DMDModelLogger
 from .runner import launch_training_task, launch_data_process_task, launch_dmd_training_task
 from .parsers import *
 from .loss import *
+from .dmd2 import *

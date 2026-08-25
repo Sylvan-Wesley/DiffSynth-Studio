@@ -19,6 +19,7 @@ class TensorBoardLogger:
 class SwanLabLogger:
     def __init__(self, project_name="DiffSynth-Studio", log_dir=None):
         import swanlab
+        project_name = os.environ.get("SWANLAB_PROJECT", project_name)
         self.swanlab = swanlab
         self.swanlab.init(project=project_name, logdir=log_dir)
         print(f"SwanLab is enabled. Project: {project_name}")
@@ -33,6 +34,7 @@ class SwanLabLogger:
 class WandbLogger:
     def __init__(self, project_name="DiffSynth-Studio", log_dir=None):
         import wandb
+        project_name = os.environ.get("WANDB_PROJECT", project_name)
         self.wandb = wandb
         self.run = self.wandb.init(project=project_name, dir=log_dir)
         print(f"Wandb is enabled. Project: {project_name}")
@@ -43,6 +45,28 @@ class WandbLogger:
     def close(self):
         self.wandb.finish()
 
+class CSVLogger:
+    def __init__(self, log_dir):
+        import csv
+        os.makedirs(log_dir, exist_ok=True)
+        self.path = os.path.join(log_dir, "loss.csv")
+        file_exists = os.path.isfile(self.path) and os.path.getsize(self.path) > 0
+        self.file = open(self.path, "a", encoding="utf-8", newline="")
+        self.writer = csv.DictWriter(self.file, fieldnames=["step", "key", "value"], lineterminator="\n")
+        if not file_exists:
+            self.writer.writeheader()
+            self.file.flush()
+
+    def log(self, key, value, step):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().float().mean().item()
+        self.writer.writerow({"step": step, "key": key, "value": value})
+        self.file.flush()
+
+    def close(self):
+        if not self.file.closed:
+            self.file.close()
+
 
 class ModelLogger:
     def __init__(
@@ -50,6 +74,7 @@ class ModelLogger:
         enable_tensorboard_log=False,
         enable_swanlab_log=False, swanlab_project="DiffSynth-Studio",
         enable_wandb_log=False, wandb_project="DiffSynth-Studio",
+        enable_csv_log=False,
     ):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
@@ -61,6 +86,7 @@ class ModelLogger:
         self.swanlab_project = swanlab_project
         self.enable_wandb_log = enable_wandb_log
         self.wandb_project = wandb_project
+        self.enable_csv_log = enable_csv_log
         self.loggers = []
         self.loggers_initialized = False
 
@@ -71,6 +97,8 @@ class ModelLogger:
             self.loggers.append(SwanLabLogger(project_name=self.swanlab_project, log_dir=os.path.join(self.output_path, "swanlab_log")))
         if self.enable_wandb_log:
             self.loggers.append(WandbLogger(project_name=self.wandb_project, log_dir=os.path.join(self.output_path, "wandb_log")))
+        if self.enable_csv_log:
+            self.loggers.append(CSVLogger(self.output_path))
         self.loggers_initialized = True
 
     def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, **kwargs):
@@ -86,14 +114,7 @@ class ModelLogger:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
     def on_epoch_end(self, accelerator: Accelerator, model: torch.nn.Module, epoch_id):
-        accelerator.wait_for_everyone()
-        state_dict = accelerator.get_state_dict(model)
-        if accelerator.is_main_process:
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
-            state_dict = self.state_dict_converter(state_dict)
-            os.makedirs(self.output_path, exist_ok=True)
-            path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
-            accelerator.save(state_dict, path, safe_serialization=True)
+        self.save_model(accelerator, model, f"epoch-{epoch_id}.safetensors")
 
     def on_training_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None):
         if save_steps is not None and self.num_steps % save_steps != 0:

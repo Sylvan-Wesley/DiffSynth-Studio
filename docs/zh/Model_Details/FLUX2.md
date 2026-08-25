@@ -2,15 +2,6 @@
 
 FLUX.2 是由 Black Forest Labs 训练并开源的图像生成模型。
 
-## 模型血缘
-
-```mermaid
-graph LR;
-    FLUX.2-Series-->black-forest-labs/FLUX.2-dev;
-    FLUX.2-Series-->black-forest-labs/FLUX.2-klein-4B;
-    FLUX.2-Series-->black-forest-labs/FLUX.2-klein-9B;
-```
-
 ## 安装
 
 在使用本项目进行模型推理和训练前，请先安装 DiffSynth-Studio。
@@ -77,6 +68,7 @@ image.save("image.jpg")
 |[DiffSynth-Studio/Template-KleinBase4B-SoftRGB](https://www.modelscope.cn/models/DiffSynth-Studio/Template-KleinBase4B-SoftRGB)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference/Template-KleinBase4B-SoftRGB.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference_low_vram/Template-KleinBase4B-SoftRGB.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/full/Template-KleinBase4B-SoftRGB.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/validate_full/Template-KleinBase4B-SoftRGB.py)|-|-|
 |[DiffSynth-Studio/Template-KleinBase4B-Upscaler](https://www.modelscope.cn/models/DiffSynth-Studio/Template-KleinBase4B-Upscaler)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference/Template-KleinBase4B-Upscaler.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference_low_vram/Template-KleinBase4B-Upscaler.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/full/Template-KleinBase4B-Upscaler.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/validate_full/Template-KleinBase4B-Upscaler.py)|-|-|
 |[DiffSynth-Studio/Template-KleinBase4B-ContentRef](https://www.modelscope.cn/models/DiffSynth-Studio/Template-KleinBase4B-ContentRef)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference/Template-KleinBase4B-ContentRef.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference_low_vram/Template-KleinBase4B-ContentRef.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/full/Template-KleinBase4B-ContentRef.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/validate_full/Template-KleinBase4B-ContentRef.py)|-|-|
+|[DiffSynth-Studio/KleinBase4B-i2L-v2](https://www.modelscope.cn/models/DiffSynth-Studio/KleinBase4B-i2L-v2)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference/KleinBase4B-i2L-v2.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_inference_low_vram/KleinBase4B-i2L-v2.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/full/KleinBase4B-i2L-v2.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/flux2/model_training/validate_full/KleinBase4B-i2L-v2.py)|-|-|
 
 特殊训练脚本：
 
@@ -124,6 +116,7 @@ FLUX.2 系列模型统一通过 [`examples/flux2/model_training/train.py`](https
         * `--model_id_with_origin_paths`: 带原始路径的模型 ID，例如 `"black-forest-labs/FLUX.2-dev:text_encoder/*.safetensors"`。用逗号分隔。
         * `--extra_inputs`: 模型 Pipeline 所需的额外输入参数，例如训练 ControlNet 模型时需要额外参数 `controlnet_inputs`，以 `,` 分隔。
         * `--fp8_models`：以 FP8 格式加载的模型，格式与 `--model_paths` 或 `--model_id_with_origin_paths` 一致，目前仅支持参数不被梯度更新的模型（不需要梯度回传，或梯度仅更新其 LoRA）。
+        * `--quant_options`：对加载的模型进行动态量化。以 `;` 分隔多个条目，每个为 `<模型字符串>:<method>[/<exclude_modules>]`，`<模型字符串>` 需与 `--model_paths`/`--model_id_with_origin_paths` 中的一致，`method` 为已注册的量化方法（如 `bitsandbytes_nf4`），`exclude_modules` 为可选的保持全精度的层。
     * 训练基础配置
         * `--learning_rate`: 学习率。
         * `--num_epochs`: 轮数（Epoch）。

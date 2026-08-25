@@ -63,6 +63,7 @@ image.save("image.jpg")
 |-|-|-|-|-|-|-|
 |[HiDream-ai/HiDream-O1-Image](https://www.modelscope.cn/models/HiDream-ai/HiDream-O1-Image)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_inference/HiDream-O1-Image.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_inference_low_vram/HiDream-O1-Image.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/full/HiDream-O1-Image.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/validate_full/HiDream-O1-Image.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/lora/HiDream-O1-Image.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/validate_lora/HiDream-O1-Image.py)|
 |[HiDream-ai/HiDream-O1-Image-Dev](https://www.modelscope.cn/models/HiDream-ai/HiDream-O1-Image-Dev)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_inference/HiDream-O1-Image-Dev.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_inference_low_vram/HiDream-O1-Image-Dev.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/full/HiDream-O1-Image-Dev.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/validate_full/HiDream-O1-Image-Dev.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/lora/HiDream-O1-Image-Dev.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/validate_lora/HiDream-O1-Image-Dev.py)|
+|[DiffSynth-Studio/HidreamO1-i2L-v2](https://www.modelscope.cn/models/DiffSynth-Studio/HidreamO1-i2L-v2)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_inference/HidreamO1-i2L-v2.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_inference_low_vram/HidreamO1-i2L-v2.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/full/HidreamO1-i2L-v2.sh)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/hidream_o1_image/model_training/validate_full/HidreamO1-i2L-v2.py)|-|-|
 
 ## 模型推理
 
@@ -102,6 +103,7 @@ hidream_o1_image 系列模型统一通过 `examples/hidream_o1_image/model_train
         * `--model_id_with_origin_paths`: 带原始路径的模型 ID。用逗号分隔。
         * `--extra_inputs`: 模型 Pipeline 所需的额外输入参数，以 `,` 分隔。
         * `--fp8_models`: 以 FP8 格式加载的模型，目前仅支持参数不被梯度更新的模型。
+        * `--quant_options`：对加载的模型进行动态量化。以 `;` 分隔多个条目，每个为 `<模型字符串>:<method>[/<exclude_modules>]`，`<模型字符串>` 需与 `--model_paths`/`--model_id_with_origin_paths` 中的一致，`method` 为已注册的量化方法（如 `bitsandbytes_nf4`），`exclude_modules` 为可选的保持全精度的层。
     * 训练基础配置
         * `--learning_rate`: 学习率。
         * `--num_epochs`: 轮数（Epoch）。

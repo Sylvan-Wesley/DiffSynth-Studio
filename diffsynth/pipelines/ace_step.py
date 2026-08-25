@@ -3,7 +3,7 @@ ACE-Step Pipeline for DiffSynth-Studio.
 
 Text-to-Music generation pipeline using ACE-Step 1.5 model.
 """
-import re, torch
+import re, torch, warnings
 from typing import Optional, Dict, Any, List, Tuple
 from tqdm import tqdm
 import random, math
@@ -118,8 +118,17 @@ class AceStepPipeline(BasePipeline):
         rand_device: str = "cpu",
         # Steps
         num_inference_steps: int = 8,
+        # Input audio
+        input_audio: Optional[torch.Tensor] = None,
         # Scheduler-specific parameters
         shift: float = 3.0,
+        # Residual
+        residual = None,
+        negative_residual = None,
+        # Tiled VAE
+        tiled: bool = False,
+        tile_size: int = 512,
+        tile_stride: int = 256,
         # Progress
         progress_bar_cmd=tqdm,
     ):
@@ -127,8 +136,8 @@ class AceStepPipeline(BasePipeline):
         self.scheduler.set_timesteps(num_inference_steps=num_inference_steps, denoising_strength=denoising_strength, shift=shift)
 
         # Parameters
-        inputs_posi = {"prompt": prompt, "positive": True}
-        inputs_nega = {"positive": False}
+        inputs_posi = {"prompt": prompt, "positive": True, "residual": residual,}
+        inputs_nega = {"positive": False, "residual": negative_residual}
         inputs_shared = {
             "cfg_scale": cfg_scale,
             "lyrics": lyrics,
@@ -142,6 +151,7 @@ class AceStepPipeline(BasePipeline):
             "rand_device": rand_device,
             "num_inference_steps": num_inference_steps,
             "shift": shift,
+            "input_audio": input_audio,
         }
 
         for unit in self.units:
@@ -167,21 +177,17 @@ class AceStepPipeline(BasePipeline):
 
         # Decode
         self.load_models_to_device(['vae'])
-        # DiT output is [B, T, 64] (channels-last), VAE expects [B, 64, T] (channels-first)
-        latents = inputs_shared["latents"].transpose(1, 2)
-        vae_output = self.vae.decode(latents)
-        audio_output = self.normalize_audio(vae_output, target_db=-1.0)
-        audio = self.output_audio_format_check(audio_output)
+        audio = self.vae_output_to_audio(inputs_shared["latents"], tiled, tile_size, tile_stride)
         self.load_models_to_device([])
         return audio
-
-    def normalize_audio(self, audio: torch.Tensor, target_db: float = -1.0) -> torch.Tensor:
+    
+    def vae_output_to_audio(self, vae_output, tiled=False, tile_size=512, tile_stride=256):
+        audio = self.vae.decode(vae_output.transpose(1, 2), tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         peak = torch.max(torch.abs(audio))
-        if peak < 1e-6:
-            return audio
-        target_amp = 10 ** (target_db / 20.0)
-        gain = target_amp / peak
-        return audio * gain
+        if peak < 1e-6: return audio
+        audio = audio * (10 ** (-1 / 20.0) / peak)
+        audio = self.output_audio_format_check(audio)
+        return audio
 
     def switch_noncover_condition(self, inputs_shared, inputs_posi, inputs_nega, progress_id):
         if inputs_shared["task_type"] != "cover" or inputs_shared["audio_cover_strength"] >= 1.0:
@@ -534,27 +540,33 @@ class AceStepUnit_NoiseInitializer(PipelineUnit):
 
 
 class AceStepUnit_InputAudioEmbedder(PipelineUnit):
-    """Only for training."""
     def __init__(self):
         super().__init__(
-            input_params=("noise", "input_audio"),
+            input_params=("noise", "input_audio", "denoising_strength"),
             output_params=("latents", "input_latents"),
             onload_model_names=("vae",),
         )
 
-    def process(self, pipe, noise, input_audio):
+    def process(self, pipe, noise, input_audio, denoising_strength):
         if input_audio is None:
             return {"latents": noise}
-        if pipe.scheduler.training:
-            pipe.load_models_to_device(self.onload_model_names)
+        pipe.load_models_to_device(self.onload_model_names)
+        if isinstance(input_audio, tuple):
             input_audio, sample_rate = input_audio
-            input_audio = torch.clamp(input_audio, -1.0, 1.0)
-            if input_audio.dim() == 2:
-                input_audio = input_audio.unsqueeze(0)
-            input_latents = pipe.vae.encode(input_audio.to(dtype=pipe.torch_dtype, device=pipe.device)).transpose(1, 2)
-            # prevent potential size mismatch between context_latents and input_latents by cropping input_latents to the same temporal length as noise
-            input_latents = input_latents[:, :noise.shape[1]]
-            return {"input_latents": input_latents}
+        input_audio = torch.clamp(input_audio, -1.0, 1.0)
+        if input_audio.dim() == 2:
+            input_audio = input_audio.unsqueeze(0)
+        input_latents = pipe.vae.encode(input_audio.to(dtype=pipe.torch_dtype, device=pipe.device)).transpose(1, 2)
+        # prevent potential size mismatch between context_latents and input_latents by cropping input_latents to the same temporal length as noise
+        input_latents = input_latents[:, :noise.shape[1]]
+        if input_latents.shape[1] < noise.shape[1]:
+            warnings.warn(f"The duration of `input_audio` is shorter than that of the generated audio, so the end of `input_audio` will be padded with zeros.")
+            input_latents = torch.concat([input_latents, torch.zeros_like(noise)[:, :noise.shape[1] - input_latents.shape[1]]], dim=1)
+        if pipe.scheduler.training:
+            return {"input_latents": input_latents, "latents": noise}
+        else:
+            latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
+            return {"latents": latents}
 
 
 def model_fn_ace_step(
@@ -565,6 +577,7 @@ def model_fn_ace_step(
     encoder_attention_mask=None,
     context_latents=None,
     attention_mask=None,
+    residual=None,
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
     **kwargs,
@@ -577,6 +590,7 @@ def model_fn_ace_step(
         encoder_hidden_states=encoder_hidden_states,
         encoder_attention_mask=encoder_attention_mask,
         context_latents=context_latents,
+        residual=residual,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )[0]

@@ -15,6 +15,7 @@
    Pipeline_Usage/Model_Inference
    Pipeline_Usage/Accelerated_Inference
    Pipeline_Usage/VRAM_management
+   Pipeline_Usage/Quantization
    Pipeline_Usage/Model_Training
    Pipeline_Usage/Environment_Variables
    Pipeline_Usage/GPU_support
@@ -38,6 +39,12 @@
    Model_Details/Stable-Diffusion
    Model_Details/Stable-Diffusion-XL
    Model_Details/Image-Quality-Metrics
+   Model_Details/Ideogram-4
+   Model_Details/Krea-2
+   Model_Details/Boogu-Image
+   Model_Details/LingBot-Video
+   Model_Details/MiniMax-H3
+   Model_Details/MiniMax-Music3
 
 .. toctree::
    :maxdepth: 2
@@ -60,6 +67,7 @@
    Developer_Guide/Building_a_Pipeline
    Developer_Guide/Enabling_VRAM_management
    Developer_Guide/Training_Diffusion_Models
+   Developer_Guide/Integrating_Quantization_Backend
 
 .. toctree::
    :maxdepth: 2
@@ -69,6 +77,7 @@
    API_Reference/core/data
    API_Reference/core/gradient
    API_Reference/core/loader
+   API_Reference/core/quant
    API_Reference/core/vram
 
 .. toctree::
@@ -86,6 +95,7 @@
 
    Research_Tutorial/train_from_scratch
    Research_Tutorial/inference_time_scaling
+   Research_Tutorial/controllable_models
 
 .. toctree::
    :maxdepth: 2

@@ -1,7 +1,30 @@
-import math, warnings
+import math, warnings, time
 import torch, torchvision, imageio, os
 import imageio.v3 as iio
+import urllib.request
+from io import BytesIO
 from PIL import Image
+from einops import repeat
+
+
+def _is_url(path):
+    return isinstance(path, str) and path.startswith(("http://", "https://"))
+
+
+def _load_image_from_url(url, timeout=30, max_retries=3):
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; DiffSynth-Studio)"})
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                image = Image.open(BytesIO(response.read()))
+                image.load()
+            return image
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Failed to load image from URL '{url}' after {max_retries} attempts: {last_error}") from last_error
 
 
 class DataProcessingPipeline:
@@ -54,12 +77,17 @@ class ToStr(DataProcessingOperator):
 
 
 class LoadImage(DataProcessingOperator):
-    def __init__(self, convert_RGB=True, convert_RGBA=False):
+    def __init__(self, convert_RGB=True, convert_RGBA=False, url_timeout=30, url_max_retries=3):
         self.convert_RGB = convert_RGB
         self.convert_RGBA = convert_RGBA
-    
+        self.url_timeout = url_timeout
+        self.url_max_retries = url_max_retries
+
     def __call__(self, data: str):
-        image = Image.open(data)
+        if _is_url(data):
+            image = _load_image_from_url(data, timeout=self.url_timeout, max_retries=self.url_max_retries)
+        else:
+            image = Image.open(data)
         if self.convert_RGB: image = image.convert("RGB")
         if self.convert_RGBA: image = image.convert("RGBA")
         return image
@@ -241,6 +269,9 @@ class ToAbsolutePath(DataProcessingOperator):
         self.base_path = base_path
         
     def __call__(self, data):
+        # A remote URL is already absolute; joining it with base_path would corrupt it.
+        if _is_url(data):
+            return data
         return os.path.join(self.base_path, data)
 
 
@@ -276,31 +307,34 @@ class LoadAudioWithTorchaudio(DataProcessingOperator, FrameSamplerByRateMixin):
                 padding = target_samples - current_samples
                 waveform = torch.nn.functional.pad(waveform, (0, padding))
             return waveform, sample_rate
-        except:
-            warnings.warn(f"Cannot load audio in {data}. The audio will be `None`.")
+        except Exception as e:
+            warnings.warn(f"Cannot load audio in {data} due to {e}. The audio will be `None`.")
             return None
 
 
 class LoadPureAudioWithTorchaudio(DataProcessingOperator):
 
-    def __init__(self, target_sample_rate=None, target_duration=None):
+    def __init__(self, target_sample_rate=None, max_audio_duration=None, padding=False, channels=2):
         self.target_sample_rate = target_sample_rate
-        self.target_duration = target_duration
+        self.max_audio_duration = max_audio_duration
         self.resample = True if target_sample_rate is not None else False
+        self.padding = padding
         from diffsynth.utils.data.audio import read_audio
         self.audio_loader = read_audio
 
     def __call__(self, data: str):
         try:
             waveform, sample_rate = self.audio_loader(data, resample=self.resample, resample_rate=self.target_sample_rate)
-            if self.target_duration is not None:
-                target_samples = int(self.target_duration * sample_rate)
+            if self.max_audio_duration is not None:
+                target_samples = int(self.max_audio_duration * sample_rate)
                 current_samples = waveform.shape[-1]
                 if current_samples > target_samples:
                     waveform = waveform[..., :target_samples]
-                elif current_samples < target_samples:
+                elif current_samples < target_samples and self.padding:
                     padding = target_samples - current_samples
                     waveform = torch.nn.functional.pad(waveform, (0, padding))
+            if waveform.shape[0] == 1:
+                waveform = repeat(waveform, "C L -> (N C) L", N=2)
             return waveform, sample_rate
         except Exception as e:
             print(f"Cannot load audio in {data} due to {e}. The audio will be `None`.")
