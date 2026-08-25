@@ -14,6 +14,8 @@ residual:
    of each latent frame's velocity slice), via SVD.
 3. Projection of r onto the subspace of v_pre: the 1-D span{v_pre} and the
    growing span{v_0..v_pre} of all prior velocities (incremental Gram-Schmidt).
+4. EDM-style straightness: the per-step deviation of the instantaneous
+   velocity from the trajectory's overall initial-to-final displacement.
 
 Output: a per-step table, a ``velocity_analysis.npz`` with all scalar + per-frame
 quantities, and (optionally) a matplotlib figure vs sigma with a marker at 0.9.
@@ -30,10 +32,6 @@ without loading the model.
 import numpy as np
 import torch
 from tqdm import tqdm
-
-from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-from diffsynth.models.wan_video_dit import set_to_torch_norm
-
 
 # ═══════════════════════════════════════════════════════════════
 # Configuration
@@ -136,6 +134,32 @@ def project_fraction_1d(r, v_pre) -> float:
     return float((_dot(r, v_pre) ** 2) / (nr2 * nv2))
 
 
+def edm_straightness_metrics(velocities, initial_latents, final_latents, sigma_start):
+    """Return EDM-style curvature and chord cosine for every denoising step.
+
+    Flow matching integrates ``dx / d sigma = v`` from ``sigma_start`` down to
+    zero.  In the straight-trajectory case, ``sigma_start * v_i`` equals the
+    global chord ``x_initial - x_final`` at every step.  The returned
+    curvature is the EDM-toy mean squared deviation from that chord, and the
+    cosine records their directional agreement.
+    """
+    if len(velocities) == 0:
+        raise ValueError("velocities must contain at least one denoising step.")
+    if sigma_start <= 0:
+        raise ValueError(f"sigma_start must be positive, got {sigma_start}.")
+
+    chord = np.asarray(initial_latents, dtype=np.float32) - np.asarray(final_latents, dtype=np.float32)
+    chord_flat = _flatten(chord)
+    curvature = np.empty(len(velocities), dtype=np.float64)
+    cosine_to_chord = np.empty(len(velocities), dtype=np.float64)
+    for i, velocity in enumerate(velocities):
+        instantaneous = float(sigma_start) * _flatten(velocity)
+        difference = instantaneous - chord_flat
+        curvature[i] = float(np.dot(difference, difference) / difference.size)
+        cosine_to_chord[i] = cosine(instantaneous, chord_flat)
+    return curvature, cosine_to_chord
+
+
 class GrowingSpan:
     """Incremental orthonormal basis of an accumulating set of velocity vectors.
 
@@ -201,6 +225,11 @@ def _detect_device() -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    # Keep the analysis helpers importable for CPU tests without requiring the
+    # complete DiffSynth inference dependency stack.
+    from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
+    from diffsynth.models.wan_video_dit import set_to_torch_norm
+
     device = _detect_device()
     print(f"Device: {device}")
 
@@ -234,6 +263,7 @@ def main():
     shape = (1, z_dim, latent_frames, latent_h, latent_w)
     latents = pipe.generate_noise(shape, seed=seed, rand_device="cpu")
     latents = latents.to(dtype=pipe.torch_dtype, device=device)
+    initial_latents = latents.detach().float().cpu().squeeze(0).numpy()
 
     scheduler.set_timesteps(num_inference_steps, denoising_strength=1.0, shift=5.0)
     sigmas = scheduler.sigmas.detach().cpu().numpy()
@@ -262,6 +292,11 @@ def main():
                 scheduler.timesteps[progress_id],
                 latents,
             )
+
+    final_latents = latents.detach().float().cpu().squeeze(0).numpy()
+    edm_curvature, cos_instant_straight = edm_straightness_metrics(
+        velocities, initial_latents, final_latents, sigma_start=float(sigmas[0]),
+    )
 
     # ═══════════════════════════════════════════════════════════
     # Analysis over consecutive pairs
@@ -326,6 +361,15 @@ def main():
             f"{f_par_1d[i]:>9.4f} {f_par_grow[i]:>10.4f}"
         )
 
+    print("\nEDM-style instantaneous velocity vs. overall straight-line displacement")
+    print(f"{'step':>4} {'sigma':>7} {'t':>5} {'curvature':>12} {'cos(v,chord)':>13}")
+    print("-" * 49)
+    for i in range(len(velocities)):
+        print(
+            f"{i:>4} {sigmas[i]:>7.3f} {int(timesteps[i]):>5} "
+            f"{edm_curvature[i]:>12.6g} {cos_instant_straight[i]:>13.4f}"
+        )
+
     np.savez(
         out_npz,
         sigmas=sigmas,
@@ -338,6 +382,8 @@ def main():
         rel_norm=rel_norm,
         f_par_1d=f_par_1d,
         f_par_grow=f_par_grow,
+        edm_curvature=edm_curvature,
+        cos_instant_straight=cos_instant_straight,
         ranks=ranks,
         stable_ranks=stable,
         singular_values=svals,
@@ -346,21 +392,24 @@ def main():
 
     if plot:
         _make_plot(pair_sigmas, cos_pre_res, pear_pre_res, rel_norm,
-                   f_par_1d, f_par_grow, ranks, out_png, sigma_marker)
+                   f_par_1d, f_par_grow, ranks, sigmas, edm_curvature,
+                   cos_instant_straight, out_png, sigma_marker)
         print(f"Saved plot to: {out_png}")
 
 
 def _make_plot(sigmas, cos_pre_res, pear_pre_res, rel_norm,
-               f_par_1d, f_par_grow, ranks, out_png, marker):
+               f_par_1d, f_par_grow, ranks, step_sigmas, edm_curvature,
+               cos_instant_straight, out_png, marker):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8), constrained_layout=True)
+    fig, axes = plt.subplots(2, 4, figsize=(21, 8), constrained_layout=True)
     x = sigmas  # descending 1 -> 0
 
-    def _plot(ax, y, title):
-        ax.plot(x, y, "o-", markersize=3)
+    def _plot(ax, y, title, x_values=None):
+        x_values = x if x_values is None else x_values
+        ax.plot(x_values, y, "o-", markersize=3)
         ax.axvline(marker, color="r", linestyle="--", alpha=0.6, label=f"sigma={marker}")
         ax.set_xlabel("sigma"); ax.set_title(title); ax.grid(alpha=0.3)
         ax.invert_xaxis()
@@ -369,6 +418,11 @@ def _make_plot(sigmas, cos_pre_res, pear_pre_res, rel_norm,
     _plot(axes[0, 0], cos_pre_res, "cos(v_pre, residual)")
     _plot(axes[0, 1], pear_pre_res, "Pearson(v_pre, residual)")
     _plot(axes[0, 2], rel_norm, "||residual|| / ||v_pre||")
+    _plot(
+        axes[0, 3], edm_curvature,
+        "EDM curvature: ||sigma_0 v - chord||^2 / D",
+        step_sigmas,
+    )
     _plot(axes[1, 0], f_par_1d, "residual energy in span{v_pre}")
     _plot(axes[1, 1], f_par_grow, "residual energy in growing span")
     _plot(axes[1, 2], ranks[..., 1].mean(axis=1), "mean per-frame rank(residual)")
@@ -376,6 +430,14 @@ def _make_plot(sigmas, cos_pre_res, pear_pre_res, rel_norm,
     axes[1, 2].plot(x, ranks[..., 0].mean(axis=1), "s--", markersize=3, label="v_pre")
     axes[1, 2].plot(x, ranks[..., 2].mean(axis=1), "^--", markersize=3, label="v_cur")
     axes[1, 2].legend()
+
+    axes[1, 3].plot(step_sigmas, cos_instant_straight, "o-", markersize=3)
+    axes[1, 3].axvline(marker, color="r", linestyle="--", alpha=0.6, label=f"sigma={marker}")
+    axes[1, 3].set_xlabel("sigma")
+    axes[1, 3].set_title("cos(instantaneous velocity, chord)")
+    axes[1, 3].grid(alpha=0.3)
+    axes[1, 3].invert_xaxis()
+    axes[1, 3].legend()
 
     fig.savefig(out_png, dpi=120)
     plt.close(fig)

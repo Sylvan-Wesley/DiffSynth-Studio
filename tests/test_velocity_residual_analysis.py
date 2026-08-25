@@ -82,6 +82,23 @@ def test_projection_1d():
     assert abs(A.project_fraction_1d(orth.reshape(v.shape), v)) < 1e-4
 
 
+def test_edm_straightness_metrics():
+    initial = np.ones((1, 1, 1, 2), dtype=np.float32)
+    final = np.zeros_like(initial)
+    velocities = [np.ones_like(initial), np.ones_like(initial)]
+    curvature, cos_to_chord = A.edm_straightness_metrics(
+        velocities, initial, final, sigma_start=1.0,
+    )
+    assert np.allclose(curvature, 0.0), curvature
+    assert np.allclose(cos_to_chord, 1.0), cos_to_chord
+
+    curvature, cos_to_chord = A.edm_straightness_metrics(
+        [2.0 * velocities[0]], initial, final, sigma_start=1.0,
+    )
+    assert np.allclose(curvature, 1.0), curvature
+    assert np.allclose(cos_to_chord, 1.0), cos_to_chord
+
+
 def test_growing_span():
     C, F, H, W = 4, 2, 6, 6
     v0 = _rand(C, F, H, W)
