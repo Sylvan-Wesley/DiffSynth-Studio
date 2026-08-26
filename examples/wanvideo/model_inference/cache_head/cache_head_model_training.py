@@ -29,11 +29,12 @@ Loss conventions follow ``diffsynth/diffusion/dmd2.py``:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
 import random
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -110,8 +111,7 @@ def dmd_loss(x0: torch.Tensor, fake_x0: torch.Tensor, teacher_x0: torch.Tensor) 
 # ═══════════════════════════════════════════════════════════════
 
 def id_hash_split(caption_ids: list[str]) -> tuple[list[str], list[str], list[str]]:
-    """Deterministic hash split of the 6,484-caption corpus into
-    ~5,484 / 500 / 500 train / val / test buckets (by id hash mod 1000)."""
+    """Deterministic 84.6% / 7.7% / 7.7% train / val / test hash split."""
     train, val, test = [], [], []
     for cid in caption_ids:
         h = int(hashlib.sha256(str(cid).encode("utf-8")).hexdigest(), 16) % 1000
@@ -394,7 +394,13 @@ class CacheHeadTrainer:
                   f"(effective batch {micro * accum} per rank, peak {peak / 1024 ** 3:.1f} GiB)")
         return micro, accum
 
-    def train(self, checkpoint_every: int = 1000, save_dir: str | None = None, log_interval: int = 50):
+    def train(
+        self,
+        checkpoint_every: int = 1000,
+        save_dir: str | None = None,
+        log_interval: int = 50,
+        wandb_run: Any | None = None,
+    ):
         _, accum = self.memory_probe()
         save_dir = Path(save_dir) if save_dir else None
         if save_dir:
@@ -447,8 +453,10 @@ class CacheHeadTrainer:
                 if global_step % log_interval == 0:
                     print(f"[{global_step}/{total}] {record['phase']} loss={record['loss']:.4e} "
                           f"fake={record['fake_score_loss']:.4e}")
+                    if wandb_run is not None:
+                        wandb_run.log(record, step=global_step)
 
-            if (save_dir and self.distributed.is_main_process and global_step > 0
+            if (save_dir and checkpoint_every > 0 and self.distributed.is_main_process and global_step > 0
                     and global_step % checkpoint_every == 0):
                 self.save(save_dir / f"cache_head_step-{global_step}.ckpt")
 
@@ -504,9 +512,35 @@ def main() -> None:
                         help="single-process device; torchrun selects cuda:LOCAL_RANK")
     parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     parser.add_argument("--save-dir", default="cache_head_output")
-    parser.add_argument("--checkpoint-every", type=int, default=1000)
-    parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=2000,
+        help="save CacheHead checkpoints every N optimizer steps (0 disables intermediate saves)",
+    )
+    parser.add_argument(
+        "--log-interval", type=int, default=50,
+        help="print and, when enabled, send W&B metrics every N optimizer steps",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        help="enable Weights & Biases logging to this project (rank 0 only)",
+    )
+    parser.add_argument("--wandb-entity", help="optional Weights & Biases entity/team")
+    parser.add_argument(
+        "--wandb-run-name",
+        help="optional W&B base run name; the launcher appends its start time",
+    )
+    parser.add_argument(
+        "--wandb-mode", choices=["online", "offline"], default="online",
+        help="Weights & Biases mode when --wandb-project is set",
+    )
     args = parser.parse_args()
+    args.wandb_start_time = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S%z")
+    if args.wandb_run_name:
+        args.wandb_run_name = f"{args.wandb_run_name}-{args.wandb_start_time}"
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be non-negative")
+    if args.log_interval <= 0:
+        parser.error("--log-interval must be positive")
 
     distributed = initialize_distributed(args.device)
     try:
@@ -604,11 +638,51 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         device=device, dtype=dtype, seed=args.seed + distributed.rank,
         distributed=distributed,
     )
-    trainer.train(
-        checkpoint_every=args.checkpoint_every,
-        save_dir=args.save_dir,
-        log_interval=args.log_interval,
-    )
+    wandb_run = initialize_wandb(args, distributed)
+    try:
+        trainer.train(
+            checkpoint_every=args.checkpoint_every,
+            save_dir=args.save_dir,
+            log_interval=args.log_interval,
+            wandb_run=wandb_run,
+        )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+
+def initialize_wandb(args: argparse.Namespace, distributed: DistributedContext) -> Any | None:
+    """Start one W&B run for a DDP job, or return ``None`` when disabled."""
+    if not args.wandb_project:
+        return None
+
+    run = None
+    error = ""
+    if distributed.is_main_process:
+        try:
+            import wandb
+
+            run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                mode=args.wandb_mode,
+                config={**vars(args), "world_size": distributed.world_size},
+                save_code=False,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+
+    initialized = distributed.all_true(not error)
+    if not initialized:
+        if run is not None:
+            run.finish(exit_code=1)
+        detail = error if distributed.is_main_process else "W&B initialization failed on rank 0"
+        raise RuntimeError(
+            "could not initialize Weights & Biases; install it with "
+            "`pip install wandb` and check your login/configuration. " + detail
+        )
+    return run
 
 
 if __name__ == "__main__":

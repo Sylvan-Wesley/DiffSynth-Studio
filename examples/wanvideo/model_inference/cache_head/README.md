@@ -23,7 +23,7 @@ MotionCache, token selection, or selector training is used.
 |---|---|
 | `cache_head_model.py` | CacheHead network (RMSNorm → timestep AdaLN → channel MLP → depthwise 3D token-grid mixer → timestep AdaLN → zero-init out-proj), schedule + config dataclasses, checkpoint I/O |
 | `fake_score_wan.py` | Strict-DMD fake-score estimator: a LoRA Wan (frozen Wan DiT clone + trainable low-rank adapters). Training-only; never exported |
-| `download_mixkit_captions.py` | Downloads the upstream Open-Sora-Plan annotation JSON and extracts the 6,484 MixKit captions into training JSONL |
+| `download_mixkit_captions.py` | Downloads the upstream Open-Sora-Plan annotation JSON and extracts its 8,230 current MixKit captions into training JSONL |
 | `cache_head_model_inference.py` | Hybrid inference runner (`hybrid` / `full` / `carry` modes), 16-state trajectory capture |
 | `cache_head_model_training.py` | Training harness + loss study: `carry_previous`, `residual_regression`, `dmd`, `dmd_plus_reg` |
 | `pca_trajectory_eval.py` | Shared-PCA trajectory-difference artifacts (npz / png / metrics json) |
@@ -47,8 +47,8 @@ MotionCache, token selection, or selector training is used.
 
 ## Running
 
-Requires a GPU box with the Wan2.1-T2V-1.3B weights and the MixKit 6,484-caption
-corpus as a JSONL (`{"id": ..., "caption": ...}`).  `--captions <path>` points
+Requires a GPU box with the Wan2.1-T2V-1.3B weights and a MixKit caption corpus
+as a JSONL (`{"id": ..., "caption": ...}`).  `--captions <path>` points
 the training harness at it.
 
 Download the captions without downloading the 27 GB MixKit video archive:
@@ -58,9 +58,13 @@ python download_mixkit_captions.py --output mixkit_captions.jsonl
 ```
 
 The downloader reads the publicly released Open-Sora-Plan v1.0 ShareGPT4V
-annotation JSON, filters MixKit records, verifies that 6,484 captions were
-found, and writes the exact JSONL contract above.  It downloads approximately
-474 MB of annotations; pass `--keep-source` to retain that source JSON.
+annotation JSON, filters MixKit records, verifies the currently published
+8,230 captions, and writes the exact JSONL contract above. The earlier 6,484
+figure referred to a curated subset; the training harness does not require it.
+It downloads approximately
+474 MB of annotations into the standard Hugging Face cache, so subsequent runs
+reuse it without downloading again.  Pass `--cache-dir <path>` to place that
+cache on a volume with more space.
 
 ```bash
 # CPU tests (any machine with torch + einops)
@@ -70,9 +74,15 @@ python -m pytest tests/ -q
 python cache_head_model_inference.py --checkpoint cache_head_final.ckpt \
     --prompt "..." --output out.mp4 --trajectory traj.npz
 
-# Train one arm (GPU)
-python cache_head_model_training.py --arm dmd_plus_reg --reg-weight 0.1 \
-    --captions mixkit_captions.jsonl --save-dir out
+# Vanilla DMD training on eight GPUs (no regression loss or warm-up)
+pip install -e '.[wandb]'  # omit this line and --wandb-project to run without W&B
+torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
+    --arm dmd --warmup-steps 0 --updates 10000 \
+    --captions mixkit_captions.jsonl --batch-size 8 --precision bf16 \
+    --save-dir runs/vanilla_dmd \
+    --wandb-project cache-head-dmd --wandb-run-name dmd-8xa100-run1
+
+# W&B records this as: dmd-8xa100-run1-YYYYMMDD-HHMMSS+ZZZZ
 
 # PCA trajectory-difference evaluation (GPU)
 python pca_trajectory_eval.py --checkpoint out/cache_head_final.ckpt \

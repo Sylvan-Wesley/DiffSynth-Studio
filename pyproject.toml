@@ -26,6 +26,7 @@ dependencies = [
     "accelerate",
     "peft",
     "datasets",
+    "huggingface_hub",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -60,6 +61,9 @@ all = [
     "torchcodec",
     "librosa",
     "streamlit"
+]
+wandb = [
+    "wandb"
 ]
 
 [tool.setuptools]

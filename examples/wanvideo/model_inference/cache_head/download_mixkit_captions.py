@@ -1,8 +1,9 @@
 """Download and normalize Open-Sora-Plan MixKit captions for CacheHead.
 
 The upstream Open-Sora-Plan v1.0 annotation file contains records for several
-stock-video sources.  This script downloads the annotation JSON only (not the
-27 GB MixKit video archive), selects the MixKit records, and writes the exact
+stock-video sources. This script fetches the annotation JSON with Hugging
+Face's cached downloader (not the 27 GB MixKit video archive), selects the
+MixKit records, and writes the
 ``{"id": ..., "caption": ...}`` JSONL contract expected by
 ``cache_head_model_training.py``.
 
@@ -16,23 +17,19 @@ import argparse
 import hashlib
 import json
 import os
-import sys
 import tempfile
-import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 
-DEFAULT_SOURCE_URL = (
-    "https://huggingface.co/datasets/LanguageBind/Open-Sora-Plan-v1.0.0/resolve/main/"
-    "sharegpt4v_path_cap_64x512x512.json?download=true"
-)
-DEFAULT_EXPECTED_COUNT = 6_484
+DEFAULT_REPO_ID = "LanguageBind/Open-Sora-Plan-v1.0.0"
+DEFAULT_FILENAME = "sharegpt4v_path_cap_64x512x512.json"
+# The current published annotation revision contains 8,230 MixKit clip-caption
+# records.  The CacheHead trainer accepts any non-empty JSONL; the historical
+# 6,484 figure described an earlier curated subset, not a parser requirement.
+DEFAULT_EXPECTED_COUNT = 8_230
 CHUNK_SIZE = 1024 * 1024
-USER_AGENT = "DiffSynth-Studio-MixKit-caption-downloader/1.0"
 
 
 def iter_json_array(path: Path) -> Iterator[Any]:
@@ -90,44 +87,36 @@ def iter_json_array(path: Path) -> Iterator[Any]:
                 raise ValueError(f"expected ',' or ']' after an array entry in {path}")
 
 
-def download_file(url: str, destination: Path, retries: int) -> None:
-    """Download ``url`` atomically, with bounded retries and progress output."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    for attempt in range(1, retries + 1):
-        temp_name: str | None = None
-        try:
-            with urlopen(request, timeout=60) as response:
-                content_length = response.headers.get("Content-Length")
-                total = int(content_length) if content_length and content_length.isdigit() else None
-                with tempfile.NamedTemporaryFile(
-                    mode="wb", prefix=f".{destination.name}.", suffix=".part",
-                    dir=destination.parent, delete=False,
-                ) as temporary:
-                    temp_name = temporary.name
-                    copied = 0
-                    next_report = 64 * 1024 * 1024
-                    while True:
-                        block = response.read(CHUNK_SIZE)
-                        if not block:
-                            break
-                        temporary.write(block)
-                        copied += len(block)
-                        if copied >= next_report:
-                            suffix = f"/{total / 1024 ** 2:.0f} MiB" if total else ""
-                            print(f"downloaded {copied / 1024 ** 2:.0f} MiB{suffix}", file=sys.stderr)
-                            next_report += 64 * 1024 * 1024
-            os.replace(temp_name, destination)
-            print(f"downloaded {destination} ({destination.stat().st_size / 1024 ** 2:.1f} MiB)")
-            return
-        except (HTTPError, URLError, OSError) as error:
-            if temp_name is not None:
-                Path(temp_name).unlink(missing_ok=True)
-            if attempt == retries:
-                raise RuntimeError(f"could not download {url}: {error}") from error
-            delay = 2 ** (attempt - 1)
-            print(f"download attempt {attempt}/{retries} failed ({error}); retrying in {delay}s", file=sys.stderr)
-            time.sleep(delay)
+def download_annotation(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    cache_dir: str | None,
+    force_download: bool,
+) -> Path:
+    """Fetch annotations through Hugging Face Hub's resumable local cache."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise RuntimeError(
+            "huggingface_hub is required. Install this repository's dependencies or run "
+            "`pip install huggingface_hub`."
+        ) from error
+
+    try:
+        path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=filename,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"could not download {repo_id}/{filename} from Hugging Face: {error}"
+        ) from error
+    return Path(path)
 
 
 def value_as_text(value: Any) -> str | None:
@@ -225,54 +214,47 @@ def main() -> None:
     )
     parser.add_argument("--output", default="mixkit_captions.jsonl", help="destination JSONL path")
     parser.add_argument(
-        "--source-url", default=DEFAULT_SOURCE_URL,
-        help="upstream annotation JSON URL (used unless --source-path is supplied)",
+        "--repo-id", default=DEFAULT_REPO_ID,
+        help="Hugging Face dataset repository (used unless --source-path is supplied)",
     )
+    parser.add_argument("--filename", default=DEFAULT_FILENAME, help="annotation filename in --repo-id")
+    parser.add_argument("--revision", default="main", help="Hugging Face dataset revision")
     parser.add_argument("--source-path", help="use an already downloaded annotation JSON instead")
     parser.add_argument(
-        "--cache-dir", default=".cache/mixkit",
-        help="where a downloaded annotation JSON is cached (default: %(default)s)",
+        "--cache-dir",
+        help="Hugging Face cache directory (default: Hugging Face's standard cache)",
     )
     parser.add_argument("--source-keyword", default="mixkit", help="case-insensitive source-path filter")
     parser.add_argument(
         "--expected-count", type=int, default=DEFAULT_EXPECTED_COUNT,
         help="fail unless this many captions are written; use 0 to disable the check",
     )
-    parser.add_argument("--retries", type=int, default=3, help="network download attempts")
+    parser.add_argument("--force-download", action="store_true", help="ignore the cached Hub file and download it again")
     parser.add_argument("--force", action="store_true", help="replace an existing output JSONL")
-    parser.add_argument(
-        "--keep-source", action="store_true",
-        help="keep a downloaded annotation JSON (it is otherwise deleted after extraction)",
-    )
     args = parser.parse_args()
 
-    if args.retries < 1:
-        parser.error("--retries must be at least one")
     if args.expected_count < 0:
         parser.error("--expected-count must be non-negative")
 
     output_path = Path(args.output)
-    source_path = Path(args.source_path) if args.source_path else Path(args.cache_dir) / "opensora_mixkit_annotations.json"
-    downloaded_here = False
-    if not source_path.is_file():
-        if args.source_path:
+    if args.source_path:
+        source_path = Path(args.source_path)
+        if not source_path.is_file():
             parser.error(f"--source-path does not exist or is not a file: {source_path}")
-        download_file(args.source_url, source_path, args.retries)
-        downloaded_here = True
-
-    try:
-        expected_count = args.expected_count or None
-        count, checksum = write_captions(
-            source_path, output_path, args.source_keyword, expected_count, args.force
+    else:
+        source_path = download_annotation(
+            args.repo_id,
+            args.filename,
+            args.revision,
+            args.cache_dir,
+            args.force_download,
         )
-    finally:
-        if downloaded_here and not args.keep_source:
-            source_path.unlink(missing_ok=True)
-            try:
-                source_path.parent.rmdir()
-            except OSError:
-                pass
+        print(f"using Hugging Face cached annotation: {source_path}")
 
+    expected_count = args.expected_count or None
+    count, checksum = write_captions(
+        source_path, output_path, args.source_keyword, expected_count, args.force
+    )
     print(f"wrote {count} captions to {output_path} (sha256={checksum})")
 
 
