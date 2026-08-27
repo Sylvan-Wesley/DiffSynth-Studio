@@ -18,6 +18,7 @@ from cache_head_model_training import (
     id_hash_split,
     prompt_split_checksum,
     regression_loss,
+    training_type_for_arm,
 )
 from fake_score_wan import FakeScoreWan
 
@@ -60,7 +61,9 @@ class FakeDit(torch.nn.Module):
         self.proj = torch.nn.Linear(tok_c, tok_c)
         self.calls = 0
 
-    def forward(self, x, timestep, context, return_noise_tokens=False):
+    def forward(self, x, timestep, context, return_noise_tokens=False, **kwargs):
+        # The real WanModel.forward accepts **kwargs (use_gradient_checkpointing,
+        # RAS knobs, ...); the double has to as well or fake_score_update fails.
         self.calls += 1
         f, h, w = self.grid
         tokens = self.patch_embedding(x)
@@ -84,15 +87,16 @@ class RecordingHead(CacheHead):
         return super().forward(tokens, timestep, grid)
 
 
-def _make_trainer(arm="residual_regression", lora_rank=2):
+def _make_trainer(arm="residual_regression", lora_rank=2, **overrides):
     torch.manual_seed(0)
     dit = FakeDit()
     scheduler = FakeScheduler(15)
     head = RecordingHead(CacheHeadConfig())
-    fake = FakeScoreWan(dit, rank=lora_rank, alpha=1.0)
+    # Non-DMD arms run without the fake-score clone entirely.
+    fake = FakeScoreWan(dit, rank=lora_rank, alpha=1.0) if arm in ("dmd", "dmd_plus_reg") else None
     dataset = [("0", "a dog runs"), ("1", "a cat sleeps"), ("2", "a bird flies")]
     schedule = CacheHeadSchedule(15, (1, 2, 6, 10, 14))
-    trainer = CacheHeadTrainer(
+    kwargs = dict(
         dit=dit, scheduler=scheduler, head=head, fake_score=fake,
         text_encode=lambda c: torch.randn(1, 4, 8),
         neg_ctx=torch.randn(1, 4, 8),
@@ -101,7 +105,23 @@ def _make_trainer(arm="residual_regression", lora_rank=2):
         arm=arm, device="cpu", dtype=torch.float32, batch_size=2,
         warmup_steps=2, updates=4, seed=0,
     )
-    return trainer
+    kwargs.update(overrides)
+    return CacheHeadTrainer(**kwargs)
+
+
+def _perturb_head(trainer, scale=0.05):
+    """The head is zero-init (residual == 0); give it a non-trivial output."""
+    with torch.no_grad():
+        trainer.head.out_proj.weight.add_(scale * torch.randn_like(trainer.head.out_proj.weight))
+
+
+def _batch(trainer, n, seed=0):
+    """A rollout batch with fixed latents/context (no RNG coupling to the trainer)."""
+    torch.manual_seed(seed)
+    return {
+        "z": torch.randn(n, *LATENT_SHAPE[1:]),
+        "ctx": torch.randn(n, 4, 8),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -202,7 +222,6 @@ def test_regression_gradient_routing():
 
     assert all(p.grad is not None for p in trainer.head.parameters())
     assert all(p.grad is None for p in trainer.dit.parameters())
-    assert all(p.grad is None for p in trainer.fake_score.parameters())
 
 
 def test_dmd_gradient_routing():
@@ -262,3 +281,168 @@ def test_train_few_steps_finite_and_checkpoint(tmp_path):
     assert len(logs) == trainer.warmup_steps + trainer.updates
     assert all(rec["finite"] for rec in logs)
     assert (tmp_path / "cache_head_final.ckpt").is_file()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Supervised arm
+# ═══════════════════════════════════════════════════════════════
+
+def test_training_type_derived_from_arm():
+    assert training_type_for_arm("supervised") == "supervised"
+    for arm in ("residual_regression", "dmd", "dmd_plus_reg"):
+        assert training_type_for_arm(arm) == "dmd"
+
+
+def test_supervised_arm_needs_no_fake_score():
+    trainer = _make_trainer("supervised")
+    assert trainer.fake_score is None
+    assert trainer.fake_opt is None
+
+
+def test_dmd_arm_requires_fake_score():
+    with pytest.raises(ValueError, match="fake-score"):
+        _make_trainer("dmd", fake_score=None)
+
+
+def test_batch_size_must_be_multiple_of_micro_batch():
+    with pytest.raises(ValueError, match="multiple of micro_batch"):
+        _make_trainer("supervised", batch_size=3, micro_batch=2)
+
+
+def test_supervised_trajectory_gradient_routing():
+    trainer = _make_trainer("supervised")
+    _perturb_head(trainer)
+    out = trainer.supervised_trajectory(_batch(trainer, 2))
+    assert torch.isfinite(out["loss"])
+    out["loss"].backward()
+
+    head_grads = [p.grad for p in trainer.head.parameters()]
+    assert all(g is not None for g in head_grads)
+    assert any(g.abs().sum() > 0 for g in head_grads)
+    assert all(p.grad is None for p in trainer.dit.parameters())
+
+
+def test_supervised_trajectory_supervises_every_head_step():
+    trainer = _make_trainer("supervised")
+    trainer.dit.calls = 0
+    trainer.head.calls = 0
+    out = trainer.supervised_trajectory(_batch(trainer, 1))
+    # A teacher query at all 15 steps (posi+nega each) and the head at the 10 head steps.
+    assert trainer.dit.calls == 30
+    assert trainer.head.calls == trainer.schedule.num_head_steps == 10
+    assert [rec["step"] for rec in out["per_step"]] == [
+        i - 1 for i in trainer.schedule.head_step_indices
+    ]
+
+
+def test_supervised_trajectory_detaches_between_head_steps():
+    """Without chaining, no head step's graph may reach a previous one."""
+    trainer = _make_trainer("supervised", chain_run_grads=False)
+    _perturb_head(trainer)
+    seen = []
+    original = trainer.head.forward
+
+    def spy(tokens, timestep, grid):
+        seen.append(tokens.requires_grad)
+        return original(tokens, timestep, grid)
+
+    trainer.head.forward = spy
+    trainer.supervised_trajectory(_batch(trainer, 1))
+    # Every head step receives a detached carry, including steps inside a run.
+    assert seen and not any(seen)
+
+
+def test_supervised_trajectory_chains_run_grads_when_enabled():
+    trainer = _make_trainer("supervised", chain_run_grads=True)
+    _perturb_head(trainer)
+    seen = []
+    original = trainer.head.forward
+
+    def spy(tokens, timestep, grid):
+        seen.append(tokens.requires_grad)
+        return original(tokens, timestep, grid)
+
+    trainer.head.forward = spy
+    trainer.supervised_trajectory(_batch(trainer, 1))
+    # Head steps 2 and 3 of each run consume a graph-carrying carry.
+    assert any(seen)
+
+
+def test_supervised_loss_is_computed_on_tokens(monkeypatch):
+    """The [B, N, C] guard must reject the latent-shaped full_step return."""
+    import cache_head_model_training as training
+
+    trainer = _make_trainer("supervised")
+    trainer.head.calls = 0
+    real_full_step = training.full_step
+
+    def swapped(*args, **kwargs):
+        noise_pred, tokens = real_full_step(*args, **kwargs)
+        # Corrupt only the teacher query at head steps -- that is the call whose
+        # return the draft mis-bound.  Swapping the anchor steps too would break
+        # the rollout before the guard ever runs.
+        if trainer.head.calls >= 1:
+            return tokens, noise_pred
+        return noise_pred, tokens
+
+    monkeypatch.setattr(training, "full_step", swapped)
+    with pytest.raises(RuntimeError, match=r"\[B, N, C\]"):
+        trainer.supervised_trajectory(_batch(trainer, 1))
+
+
+def test_supervised_loss_matches_manual_token_space_loss():
+    trainer = _make_trainer("supervised")
+    _perturb_head(trainer)
+    out = trainer.supervised_trajectory(_batch(trainer, 1))
+    manual = sum(rec["loss"] for rec in out["per_step"]) / trainer.schedule.num_head_steps
+    assert out["loss"].item() == pytest.approx(manual, rel=1e-5)
+
+
+def test_supervised_batch_matches_two_single_rollouts():
+    trainer = _make_trainer("supervised")
+    _perturb_head(trainer)
+    batch = _batch(trainer, 2)
+    both = trainer.supervised_trajectory(batch)
+
+    singles = []
+    for i in range(2):
+        one = {"z": batch["z"][i:i + 1], "ctx": batch["ctx"][i:i + 1]}
+        singles.append(trainer.supervised_trajectory(one)["loss"].item())
+    # MSE/Huber average over the batch, so the batched loss is the mean.
+    assert both["loss"].item() == pytest.approx(sum(singles) / 2, rel=1e-4)
+
+
+def test_train_rejects_unknown_training_type():
+    trainer = _make_trainer("supervised")
+    with pytest.raises(ValueError, match="training_type"):
+        trainer.train(training_type="bogus", log_interval=1000)
+
+
+def test_train_supervised_runs_epochs_and_validates(tmp_path):
+    val = [("9", "a fox waits"), ("8", "a wave breaks")]
+    trainer = _make_trainer(
+        "supervised", batch_size=2, micro_batch=1, epochs=2,
+        val_dataset=val, val_batches=1,
+    )
+    _perturb_head(trainer)
+    logs = trainer.train(save_dir=str(tmp_path), checkpoint_every=0, log_interval=1000)
+
+    train_records = [r for r in logs if r["phase"] == "supervised"]
+    val_records = [r for r in logs if r["phase"] == "val"]
+    assert train_records and all(r["finite"] for r in train_records)
+    # 3 prompts, micro_batch 1 x accum 2 -> 1 optimizer step per epoch, 2 epochs.
+    assert len(train_records) == 2
+    assert len(val_records) == 2
+    assert all(torch.isfinite(torch.tensor(r["val_loss"])) for r in val_records)
+    # Per-head-step detail is what the heat map is read against.
+    assert set(val_records[0]["val_per_step"]) == {
+        i - 1 for i in trainer.schedule.head_step_indices
+    }
+    assert (tmp_path / "cache_head_final.ckpt").is_file()
+    assert (tmp_path / "cache_head_best.ckpt").is_file()
+
+
+def test_supervised_epoch_needs_enough_prompts():
+    trainer = _make_trainer("supervised", batch_size=8, micro_batch=2)
+    with pytest.raises(ValueError, match="at least"):
+        trainer.train(log_interval=1000)

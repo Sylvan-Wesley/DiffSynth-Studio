@@ -41,6 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cache_head_model import (
+    WAN_NOISE_TOKEN_CHANNELS,
     CacheHead,
     CacheHeadConfig,
     CacheHeadSchedule,
@@ -50,6 +51,20 @@ from cache_head_model import (
 from cache_head_model_inference import full_step, head_step
 from cache_head_ddp import DistributedContext, initialize_distributed
 from fake_score_wan import FakeScoreWan
+
+
+# Arms that train a head.  ``carry_previous`` is the zero-init baseline and is
+# never trained.  The loop an arm runs is derived from the arm itself rather
+# than a second, orthogonal switch.
+DMD_ARMS = ("dmd", "dmd_plus_reg")
+TRAINING_ARMS = ("residual_regression", "supervised") + DMD_ARMS
+TRAINING_TYPES = ("dmd", "supervised")
+
+
+def training_type_for_arm(arm: str) -> str:
+    """The training loop an arm runs: the epoch/validation loop for
+    ``supervised``, the step-based DMD loop for everything else."""
+    return "supervised" if arm == "supervised" else "dmd"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -188,7 +203,7 @@ class CacheHeadTrainer:
         dit: nn.Module,
         scheduler,
         head: CacheHead,
-        fake_score: FakeScoreWan,
+        fake_score: FakeScoreWan | None,
         text_encode: Callable[[str], torch.Tensor],
         neg_ctx: torch.Tensor,
         dataset: PromptDataset,
@@ -203,9 +218,15 @@ class CacheHeadTrainer:
         lr: float = 1e-4,
         lora_lr: float = 1e-4,
         batch_size: int = 8,
+        micro_batch: int = 1,
         grad_clip: float = 1.0,
         warmup_steps: int = 2000,
         updates: int = 10000,
+        epochs: int = 1,
+        chain_run_grads: bool = False,
+        text_encode_batch: Callable[[list[str]], torch.Tensor] | None = None,
+        val_dataset: PromptDataset | None = None,
+        val_batches: int = 8,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
         sigma_min: float = 0.001,
@@ -213,8 +234,17 @@ class CacheHeadTrainer:
         seed: int = 0,
         distributed: DistributedContext | None = None,
     ):
-        if arm not in ("residual_regression", "dmd", "dmd_plus_reg"):
-            raise ValueError(f"arm must be a training arm, got {arm!r} (carry_previous is not trained)")
+        if arm not in TRAINING_ARMS:
+            raise ValueError(
+                f"arm must be one of {TRAINING_ARMS}, got {arm!r} (carry_previous is not trained)"
+            )
+        if batch_size % micro_batch != 0:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be a multiple of micro_batch ({micro_batch}) "
+                f"so the effective batch is exactly what was requested"
+            )
+        if arm in DMD_ARMS and fake_score is None:
+            raise ValueError(f"arm {arm!r} needs a fake-score estimator, got fake_score=None")
         self.dit = dit
         self.scheduler = scheduler
         self.head = head
@@ -231,9 +261,14 @@ class CacheHeadTrainer:
         self.reg_loss = reg_loss
         self.reg_weight = reg_weight
         self.batch_size = batch_size
+        self.micro_batch = micro_batch
         self.grad_clip = grad_clip
         self.warmup_steps = warmup_steps
         self.updates = updates
+        self.epochs = epochs
+        self.chain_run_grads = chain_run_grads
+        self.val_dataset = val_dataset
+        self.val_batches = val_batches
         self.device = device
         self.dtype = dtype
         self.sigma_min = sigma_min
@@ -242,6 +277,10 @@ class CacheHeadTrainer:
         self.distributed = distributed or DistributedContext(
             rank=0, local_rank=0, world_size=1, device=torch.device(device)
         )
+
+        # Batched text encoding falls back to per-caption encoding so callers
+        # that only supply ``text_encode`` (the CPU tests) keep working.
+        self._text_encode_batch = text_encode_batch
 
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
@@ -252,11 +291,17 @@ class CacheHeadTrainer:
         assert all(not p.requires_grad for p in self.dit.parameters()), "teacher Wan must be frozen"
         self.head.train()
         self.head_opt = torch.optim.AdamW(self.head.parameters(), lr=lr, weight_decay=1e-2)
-        self.fake_score_module = self.distributed.unwrap(self.fake_score)
-        self.fake_opt = torch.optim.AdamW(
-            list(self.fake_score_module.lora_parameters()), lr=lora_lr, weight_decay=1e-2
-        )
-        self.fake_score.eval()
+        # The fake-score estimator deep-copies the whole DiT, so the non-DMD
+        # arms skip it entirely and spend that memory on a larger micro-batch.
+        if self.fake_score is None:
+            self.fake_score_module = None
+            self.fake_opt = None
+        else:
+            self.fake_score_module = self.distributed.unwrap(self.fake_score)
+            self.fake_opt = torch.optim.AdamW(
+                list(self.fake_score_module.lora_parameters()), lr=lora_lr, weight_decay=1e-2
+            )
+            self.fake_score.eval()
 
         self.logs: list[dict] = []
 
@@ -270,7 +315,44 @@ class CacheHeadTrainer:
         step_j = self.rng.choice(self.schedule.head_step_indices) - 1
         return {"z": z, "ctx": ctx, "step_j": step_j}
 
+    def encode_captions(self, captions: list[str]) -> torch.Tensor:
+        """Context embeddings ``[B, L, D]`` for a list of captions."""
+        if self._text_encode_batch is not None:
+            return self._text_encode_batch(captions)
+        return torch.cat([self.text_encode(c) for c in captions], dim=0)
+
+    def make_batch(self, captions: list[str]) -> dict:
+        """Build a batched rollout input from explicit captions."""
+        ctx = self.encode_captions(captions)
+        z = torch.randn(
+            len(captions), *self.latent_shape[1:], device=self.device, dtype=self.dtype
+        )
+        return {"z": z, "ctx": ctx, "captions": captions}
+
+    def sample_batch(self, n: int) -> dict:
+        """Batched rollout input from ``n`` randomly drawn training prompts."""
+        captions = [
+            self.dataset[self.rng.randrange(len(self.dataset))][1] for _ in range(n)
+        ]
+        return self.make_batch(captions)
+
+    def _neg_ctx_for(self, batch: int) -> torch.Tensor:
+        """Broadcast the single negative prompt embedding across the batch."""
+        if self.neg_ctx.shape[0] == batch:
+            return self.neg_ctx
+        return self.neg_ctx.expand(batch, *self.neg_ctx.shape[1:])
+
     def _t(self, step_id: int) -> torch.Tensor:
+        """Model-facing timestep, always shape ``[1]``.
+
+        Deliberately not expanded to ``[B]``: ``FlowMatchScheduler.step``
+        computes ``argmin((self.timesteps - timestep).abs())`` against a
+        ``[num_inference_steps]`` tensor, so a ``[B]`` timestep fails to
+        broadcast.  Wan's ``t_mod`` (``[1, 6, dim]``) and CacheHead's
+        ``TimestepAdaLN`` (``[1, 1, C]``) both broadcast a ``[1]`` timestep
+        over the batch correctly, and every sample in a batch shares the same
+        rollout step anyway.
+        """
         return self.scheduler.timesteps[step_id].reshape(1).to(device=self.device, dtype=self.dtype)
 
     def _sigma(self, step_id: int) -> torch.Tensor:
@@ -351,6 +433,75 @@ class CacheHeadTrainer:
             loss = loss + self.reg_weight * reg
         return {"loss": loss, "x0_G": x0_G, "v_tokens": v_tokens}
 
+    def supervised_trajectory(self, batch: dict) -> dict:
+        """Roll one batched hybrid trajectory, supervising every head step.
+
+        At each head step the head predicts ``v_hat = v_prev + r(v_prev, t)``
+        and frozen Wan is queried at the *same* hybrid state to produce the
+        target.  Unlike ``regression``, which spends a whole prefix rollout to
+        supervise a single sampled step, this supervises all ten head steps of
+        one rollout, so one trajectory yields ``10 * B`` targets.
+
+        The loss lives entirely in noise-token space ``[B, N, C]``; the
+        unpatchified ``[B, C, F, H, W]`` latent is used only to advance the
+        scheduler and never enters the loss.
+        """
+        latents, ctx = batch["z"], batch["ctx"]
+        n_batch = latents.shape[0]
+        neg_ctx = self._neg_ctx_for(n_batch)
+        expected_tokens = (n_batch, self.grid[0] * self.grid[1] * self.grid[2])
+
+        prev_guided = None
+        total = None
+        per_step: list[dict] = []
+
+        for k in range(self.schedule.num_inference_steps):
+            t = self._t(k)
+            if self.schedule.is_full_step(k):
+                with torch.no_grad():
+                    noise_pred, prev_guided = full_step(
+                        self.dit, latents, t, ctx, neg_ctx, self.cfg
+                    )
+            else:
+                if prev_guided is None:
+                    raise RuntimeError(
+                        f"head step at progress {k} before any full step; "
+                        f"invalid schedule {self.schedule}"
+                    )
+                v_tokens = prev_guided + self.head(prev_guided, t, self.grid)
+                with torch.no_grad():
+                    _, teacher_tokens = full_step(
+                        self.dit, latents, t, ctx, neg_ctx, self.cfg
+                    )
+                # Guard the [B, N, C] contract: full_step also returns a
+                # latent-shaped tensor, and pairing the wrong one here is the
+                # easiest way to silently move the loss out of token space.
+                if v_tokens.shape != teacher_tokens.shape or v_tokens.shape[:2] != expected_tokens:
+                    raise RuntimeError(
+                        f"supervised loss expects [B, N, C] noise tokens "
+                        f"{expected_tokens + (WAN_NOISE_TOKEN_CHANNELS,)}, got "
+                        f"head {tuple(v_tokens.shape)} vs teacher {tuple(teacher_tokens.shape)}"
+                    )
+                step_loss = regression_loss(v_tokens, teacher_tokens, self.reg_loss)
+                total = step_loss if total is None else total + step_loss
+                per_step.append({"step": k, "loss": float(step_loss.detach().item())})
+                noise_pred = unpatchify_tokens(v_tokens, self.grid, self.patch)
+                # Detach between head steps unless the run is explicitly
+                # chained: the head feeds itself across consecutive head steps,
+                # and keeping that graph is a deliberate (costlier) choice.
+                prev_guided = v_tokens if self.chain_run_grads else v_tokens.detach()
+
+            # The trajectory itself never carries gradient; only each head
+            # step's own prediction does.  Without this the graph would span
+            # all fifteen steps.
+            with torch.no_grad():
+                latents = self.scheduler.step(noise_pred.detach(), t, latents)
+
+        if total is None:
+            raise RuntimeError(f"schedule {self.schedule} has no head steps to supervise")
+        loss = total / self.schedule.num_head_steps
+        return {"loss": loss, "per_step": per_step}
+
     def fake_score_update(self, sample: dict) -> torch.Tensor:
         """Denoising loss for the LoRA fake-score on a stop-grad generated sample."""
         x0_G = self._generator_x0(sample)
@@ -371,23 +522,37 @@ class CacheHeadTrainer:
 
     # ---- memory probe + training loop ------------------------------------
 
-    def memory_probe(self) -> tuple[int, int]:
-        """Report the B=1 peak and configure true per-rank accumulation.
+    def memory_probe(self, training_type: str = "dmd") -> tuple[int, int]:
+        """Report the peak for the *requested* micro-batch and derive accumulation.
 
-        ``sample_one`` produces one sample, so this harness has no larger
-        micro-batch to select dynamically.  ``batch_size`` is therefore the
-        exact number of B=1 accumulation steps on every rank.
+        This reports, it does not search.  ``micro_batch`` is an explicit
+        setting so the effective batch is identical across runs and across
+        ranks; a micro-batch that does not fit raises here, at startup, with an
+        actionable message rather than mid-epoch.
         """
+        micro = self.micro_batch
+        accum = self.batch_size // micro
         if torch.device(self.device).type == "cpu":
-            return 1, self.distributed.max_int(self.batch_size)
+            return micro, accum
+
         torch.cuda.reset_peak_memory_stats()
-        sample = self.sample_one()
-        out = self.regression(sample)  # representative: prefix + teacher query + head backward
-        out["loss"].backward()
+        try:
+            if training_type == "supervised":
+                out = self.supervised_trajectory(self.sample_batch(micro))
+            else:
+                # Representative of the DMD loop: prefix + teacher query + head backward.
+                out = self.regression(self.sample_one())
+            out["loss"].backward()
+        except torch.cuda.OutOfMemoryError as exc:
+            self.head_opt.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            raise torch.cuda.OutOfMemoryError(
+                f"--micro-batch {micro} does not fit on {self.device} for arm {self.arm!r}. "
+                f"Lower --micro-batch (keeping --batch-size a multiple of it) to trade "
+                f"throughput for memory; the effective batch is unchanged."
+            ) from exc
         self.head_opt.zero_grad(set_to_none=True)
         peak = torch.cuda.max_memory_allocated()
-        micro = 1
-        accum = self.distributed.max_int(self.batch_size)
         torch.cuda.reset_peak_memory_stats()
         if self.distributed.is_main_process:
             print(f"[memory probe] micro-batch={micro}, gradient accumulation={accum} "
@@ -400,18 +565,178 @@ class CacheHeadTrainer:
         save_dir: str | None = None,
         log_interval: int = 50,
         wandb_run: Any | None = None,
+        training_type: str | None = None,
+        heatmap_hook: Callable[[int, Path], Any] | None = None,
     ):
-        _, accum = self.memory_probe()
+        """Run the loop this arm calls for.
+
+        ``training_type`` defaults to the arm's own loop and exists so tests can
+        drive either loop directly; an unrecognized value raises rather than
+        silently running neither and saving an untrained checkpoint.
+        """
+        if training_type is None:
+            training_type = training_type_for_arm(self.arm)
+        if training_type not in TRAINING_TYPES:
+            raise ValueError(
+                f"training_type must be one of {TRAINING_TYPES}, got {training_type!r}"
+            )
+
+        _, accum = self.memory_probe(training_type)
         save_dir = Path(save_dir) if save_dir else None
         if save_dir:
             if self.distributed.is_main_process:
                 save_dir.mkdir(parents=True, exist_ok=True)
             self.distributed.barrier()
 
-        total = self.warmup_steps + self.updates
         self.logs = []
+        if training_type == "supervised":
+            self._train_supervised(
+                accum=accum, checkpoint_every=checkpoint_every, save_dir=save_dir,
+                log_interval=log_interval, wandb_run=wandb_run, heatmap_hook=heatmap_hook,
+            )
+        else:
+            self._train_dmd(
+                accum=accum, checkpoint_every=checkpoint_every, save_dir=save_dir,
+                log_interval=log_interval, wandb_run=wandb_run,
+            )
+
+        if save_dir and self.distributed.is_main_process:
+            self.save(save_dir / "cache_head_final.ckpt")
+            with open(save_dir / "run_log.json", "w", encoding="utf-8") as fh:
+                json.dump(self.logs, fh, indent=2)
+        self.distributed.barrier()
+        return self.logs
+
+    # ---- supervised: epoch + validation loop -----------------------------
+
+    @torch.no_grad()
+    def validate(self) -> dict:
+        """Mean supervised loss over the val split, plus per-head-step detail.
+
+        Per-head-step loss is the diagnostic that pairs with the error heat
+        map: it says *when* the head drifts, the heat map says *where*.
+        """
+        if self.val_dataset is None:
+            return {}
+        was_training = self.head.training
+        self.head.eval()
+        rng = random.Random(self.seed)
+        totals: dict[int, float] = {}
+        overall = 0.0
+        n_batches = min(self.val_batches, max(1, len(self.val_dataset) // self.micro_batch))
+        for _ in range(n_batches):
+            captions = [
+                self.val_dataset[rng.randrange(len(self.val_dataset))][1]
+                for _ in range(self.micro_batch)
+            ]
+            out = self.supervised_trajectory(self.make_batch(captions))
+            overall += float(out["loss"].detach().item())
+            for rec in out["per_step"]:
+                totals[rec["step"]] = totals.get(rec["step"], 0.0) + rec["loss"]
+        if was_training:
+            self.head.train()
+        return {
+            "val_loss": self.distributed.mean_float(overall / n_batches),
+            "val_per_step": {
+                k: self.distributed.mean_float(v / n_batches) for k, v in sorted(totals.items())
+            },
+        }
+
+    def _train_supervised(
+        self, *, accum: int, checkpoint_every: int, save_dir: Path | None,
+        log_interval: int, wandb_run: Any | None,
+        heatmap_hook: Callable[[int, Path], Any] | None = None,
+    ) -> None:
+        captions = [caption for _, caption in self.dataset]
+        per_step_batch = self.micro_batch * accum
+        # Every rank must run the same number of optimizer steps: ranks hold
+        # disjoint prompt shards that can differ in length, and a rank with an
+        # extra step blocks forever in DDP's gradient all-reduce.
+        steps_per_epoch = self.distributed.min_int(len(captions) // per_step_batch)
+        if steps_per_epoch < 1:
+            raise ValueError(
+                f"rank {self.distributed.rank} has {len(captions)} prompts but needs at least "
+                f"{per_step_batch} (--micro-batch x accumulation) for one optimizer step; "
+                f"raise --subset or lower --batch-size/--micro-batch"
+            )
+
+        global_step = 0
+        best_val = float("inf")
+        for epoch in range(self.epochs):
+            order = list(captions)
+            random.Random(self.seed + epoch).shuffle(order)
+            cursor = 0
+            for step_in_epoch in range(steps_per_epoch):
+                self.head_opt.zero_grad(set_to_none=True)
+                micro_losses = []
+                per_step_acc: dict[int, float] = {}
+                for micro_step in range(accum):
+                    with self.distributed.no_sync(self.head, enabled=micro_step < accum - 1):
+                        chunk = order[cursor:cursor + self.micro_batch]
+                        cursor += self.micro_batch
+                        out = self.supervised_trajectory(self.make_batch(chunk))
+                        (out["loss"] / accum).backward()
+                        micro_losses.append(float(out["loss"].detach().item()))
+                        for rec in out["per_step"]:
+                            per_step_acc[rec["step"]] = per_step_acc.get(rec["step"], 0.0) + rec["loss"]
+                torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
+                self.head_opt.step()
+
+                loss_value = sum(micro_losses) / len(micro_losses)
+                finite = self.distributed.all_true(bool(torch.isfinite(torch.tensor(loss_value)).item()))
+                if not finite:
+                    raise RuntimeError(f"non-finite loss at epoch {epoch} step {step_in_epoch}")
+
+                record = {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "phase": self.arm,
+                    "loss": loss_value,
+                    "fake_score_loss": float("nan"),
+                    "per_step": {k: v / accum for k, v in sorted(per_step_acc.items())},
+                    "finite": finite,
+                }
+                if self.distributed.is_main_process:
+                    self.logs.append(record)
+                    if global_step % log_interval == 0:
+                        print(f"[epoch {epoch} {step_in_epoch}/{steps_per_epoch}] "
+                              f"{record['phase']} loss={record['loss']:.4e}")
+                        if wandb_run is not None:
+                            wandb_run.log(
+                                {"loss": record["loss"], "epoch": epoch}, step=global_step
+                            )
+
+                if (save_dir and checkpoint_every > 0 and self.distributed.is_main_process
+                        and global_step > 0 and global_step % checkpoint_every == 0):
+                    self.save(save_dir / f"cache_head_step-{global_step}.ckpt")
+                global_step += 1
+
+            # --- end of epoch: validation, best checkpoint, heat map ---
+            metrics = self.validate()
+            if metrics:
+                self.logs.append({"step": global_step, "epoch": epoch, "phase": "val", **metrics})
+                if self.distributed.is_main_process:
+                    print(f"[epoch {epoch}] val_loss={metrics['val_loss']:.4e}")
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {"val_loss": metrics["val_loss"], "epoch": epoch}, step=global_step
+                        )
+                    if save_dir and metrics["val_loss"] < best_val:
+                        best_val = metrics["val_loss"]
+                        self.save(save_dir / "cache_head_best.ckpt")
+            if heatmap_hook is not None and save_dir and self.distributed.is_main_process:
+                heatmap_hook(epoch, save_dir)
+            self.distributed.barrier()
+
+    # ---- DMD: step-based loop --------------------------------------------
+
+    def _train_dmd(
+        self, *, accum: int, checkpoint_every: int, save_dir: Path | None,
+        log_interval: int, wandb_run: Any | None,
+    ) -> None:
+        total = self.warmup_steps + self.updates
         for global_step in range(total):
-            use_dmd = self.arm in ("dmd", "dmd_plus_reg") and global_step >= self.warmup_steps
+            use_dmd = self.arm in DMD_ARMS and global_step >= self.warmup_steps
 
             # --- CacheHead update (gradient accumulation) ---
             self.head_opt.zero_grad(set_to_none=True)
@@ -460,13 +785,6 @@ class CacheHeadTrainer:
                     and global_step % checkpoint_every == 0):
                 self.save(save_dir / f"cache_head_step-{global_step}.ckpt")
 
-        if save_dir and self.distributed.is_main_process:
-            self.save(save_dir / "cache_head_final.ckpt")
-            with open(save_dir / "run_log.json", "w", encoding="utf-8") as fh:
-                json.dump(self.logs, fh, indent=2)
-        self.distributed.barrier()
-        return self.logs
-
     def save(self, path: str | Path) -> Path:
         cfg = CacheHeadConfig(
             model_id=getattr(self.dit, "_cache_head_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
@@ -488,7 +806,7 @@ def main() -> None:
             "cache_head_model_training.py [arguments]"
         ),
     )
-    parser.add_argument("--arm", choices=["residual_regression", "dmd", "dmd_plus_reg"], required=True)
+    parser.add_argument("--arm", choices=list(TRAINING_ARMS), required=True)
     parser.add_argument("--captions", required=True, help="MixKit caption JSONL path")
     parser.add_argument("--model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
     parser.add_argument("--subset", type=int, default=1024, help="train subset (first proof: 1024)")
@@ -499,6 +817,24 @@ def main() -> None:
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=8,
                         help="effective batch per rank, implemented with gradient accumulation")
+    parser.add_argument("--micro-batch", type=int, default=1,
+                        help="prompts per forward pass; must divide --batch-size. "
+                             "Raise it until the startup memory probe reports an OOM, then "
+                             "step back one")
+    parser.add_argument("--epochs", type=int, default=1,
+                        help="supervised arm: passes over the train prompt split")
+    parser.add_argument("--val-subset", type=int, default=128,
+                        help="supervised arm: prompts drawn from the held-out val split")
+    parser.add_argument("--val-batches", type=int, default=8,
+                        help="supervised arm: validation batches per epoch")
+    parser.add_argument("--chain-run-grads", action="store_true",
+                        help="supervised arm: backpropagate through consecutive head-step runs "
+                             "so within-run drift is penalized (costs ~3x head activations)")
+    parser.add_argument("--heatmap-every", type=int, default=0,
+                        help="supervised arm: render a per-patch head-vs-teacher error heat map "
+                             "every N epochs (0 disables)")
+    parser.add_argument("--heatmap-prompts", type=int, default=2,
+                        help="prompts in the fixed heat-map batch")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--reg-weight", type=float, default=0.1)
     parser.add_argument("--reg-loss", choices=["huber", "mse"], default="huber")
@@ -539,6 +875,17 @@ def main() -> None:
         args.wandb_run_name = f"{args.wandb_run_name}-{args.wandb_start_time}"
     if args.checkpoint_every < 0:
         parser.error("--checkpoint-every must be non-negative")
+    if args.micro_batch < 1:
+        parser.error("--micro-batch must be positive")
+    if args.batch_size % args.micro_batch != 0:
+        parser.error(
+            f"--batch-size ({args.batch_size}) must be a multiple of "
+            f"--micro-batch ({args.micro_batch})"
+        )
+    if args.epochs < 1:
+        parser.error("--epochs must be positive")
+    if args.heatmap_every < 0:
+        parser.error("--heatmap-every must be non-negative")
     if args.log_interval <= 0:
         parser.error("--log-interval must be positive")
 
@@ -579,18 +926,30 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
     pipe.text_encoder.requires_grad_(False)
 
     @torch.no_grad()
-    def encode(text: str) -> torch.Tensor:
+    def encode(text: str | list[str]) -> torch.Tensor:
+        """Encode one caption or a list of them to ``[B, L, D]``.
+
+        The tokenizer pads to a fixed ``seq_len`` (512) and accepts a list, so
+        a batch stacks natively.  Note the per-row indexing when zeroing the
+        padding: ``diffsynth``'s own ``encode_prompt`` writes ``emb[:, v:] = 0``
+        inside the loop, which zeroes *every* row at *every* sequence length.
+        That is invisible at B=1 and silently truncates all but the shortest
+        caption at B>1.
+        """
         ids, mask = pipe.tokenizer(text, return_mask=True, add_special_tokens=True)
         ids = ids.to(pipe.device)
         mask = mask.to(pipe.device)
         seq_lens = mask.gt(0).sum(dim=1).long()
         emb = pipe.text_encoder(ids, mask)
-        for v in seq_lens:
-            emb[:, v:] = 0
+        for i, v in enumerate(seq_lens):
+            emb[i, v:] = 0
         return emb.detach()
 
     def text_encode(caption: str) -> torch.Tensor:
         return encode(caption)
+
+    def text_encode_batch(captions: list[str]) -> torch.Tensor:
+        return encode(list(captions))
 
     neg_ctx = encode(
         "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，"
@@ -601,9 +960,14 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
     schedule = CacheHeadSchedule(num_inference_steps=args.num_steps, full_step_indices=(1, 2, 6, 10, 14))
     config = CacheHeadConfig(model_id=args.model_id, schedule=schedule, cfg_scale=args.cfg)
     head = CacheHead(config).to(device=device, dtype=dtype)
-    fake_score = FakeScoreWan(dit, rank=args.lora_rank).to(device=device, dtype=dtype)
+    # FakeScoreWan deep-copies the whole DiT; only the DMD arms need it, and
+    # skipping it frees that memory for a larger --micro-batch.
+    if args.arm in DMD_ARMS:
+        fake_score = FakeScoreWan(dit, rank=args.lora_rank).to(device=device, dtype=dtype)
+        fake_score = distributed.wrap(fake_score)
+    else:
+        fake_score = None
     head = distributed.wrap(head)
-    fake_score = distributed.wrap(fake_score)
 
     dataset = PromptDataset(
         args.captions,
@@ -612,10 +976,21 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         rank=distributed.rank,
         world_size=distributed.world_size,
     )
+    val_dataset = None
+    if args.arm == "supervised":
+        val_dataset = PromptDataset(
+            args.captions,
+            split="val",
+            subset=args.val_subset,
+            rank=distributed.rank,
+            world_size=distributed.world_size,
+        )
     if distributed.is_main_process:
         print(f"[DDP] world size={distributed.world_size}, per-rank device={device}")
         print(f"Train prompts per rank: {len(dataset)} "
               f"(local split checksum {prompt_split_checksum([cid for cid, _ in dataset.items])})")
+        if val_dataset is not None:
+            print(f"Val prompts per rank: {len(val_dataset)}")
 
     scheduler = pipe.scheduler
     scheduler.set_timesteps(schedule.num_inference_steps, denoising_strength=1.0, shift=5.0)
@@ -633,8 +1008,12 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         schedule=schedule, cfg_scale=args.cfg, patch_size=dit.patch_size, grid=grid,
         latent_shape=latent_shape, arm=args.arm, reg_loss=args.reg_loss,
         reg_weight=args.reg_weight, lr=args.lr, lora_lr=args.lora_lr,
-        batch_size=args.batch_size, grad_clip=args.grad_clip,
+        batch_size=args.batch_size, micro_batch=args.micro_batch,
+        grad_clip=args.grad_clip,
         warmup_steps=args.warmup_steps, updates=args.updates,
+        epochs=args.epochs, chain_run_grads=args.chain_run_grads,
+        text_encode_batch=text_encode_batch,
+        val_dataset=val_dataset, val_batches=args.val_batches,
         device=device, dtype=dtype, seed=args.seed + distributed.rank,
         distributed=distributed,
     )
@@ -645,10 +1024,73 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
             save_dir=args.save_dir,
             log_interval=args.log_interval,
             wandb_run=wandb_run,
+            heatmap_hook=build_heatmap_hook(args, trainer, wandb_run),
         )
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+
+
+def build_heatmap_hook(
+    args: argparse.Namespace, trainer: CacheHeadTrainer, wandb_run: Any | None
+) -> Callable[[int, Path], None] | None:
+    """End-of-epoch per-patch error heat map, or ``None`` when disabled.
+
+    Uses a fixed prompt set and a fixed seed on every call so successive epochs
+    are directly comparable -- a heat map that moves because the prompts moved
+    would say nothing about the head.
+    """
+    if args.heatmap_every <= 0 or args.arm != "supervised":
+        return None
+
+    from cache_head_error_heatmap import (
+        collect_step_errors,
+        render_error_heatmap,
+        save_error_arrays,
+    )
+
+    source = trainer.val_dataset if trainer.val_dataset is not None else trainer.dataset
+    captions = [caption for _, caption in source.items[:args.heatmap_prompts]]
+    if not captions:
+        return None
+
+    def hook(epoch: int, save_dir: Path) -> None:
+        if epoch % args.heatmap_every != 0:
+            return
+        generator = torch.Generator(device="cpu").manual_seed(args.seed)
+        latents = torch.randn(
+            len(captions), *trainer.latent_shape[1:], generator=generator
+        ).to(device=trainer.device, dtype=trainer.dtype)
+        head = trainer.distributed.unwrap(trainer.head)
+        was_training = head.training
+        head.eval()
+        try:
+            result = collect_step_errors(
+                dit=trainer.dit, scheduler=trainer.scheduler, head=head,
+                schedule=trainer.schedule, cfg_scale=trainer.cfg,
+                patch_size=trainer.patch, grid=trainer.grid,
+                latents=latents, ctx=trainer.encode_captions(captions),
+                neg_ctx=trainer.neg_ctx,
+            )
+        finally:
+            if was_training:
+                head.train()
+        out_dir = Path(save_dir) / "heatmaps"
+        png = render_error_heatmap(
+            result, out_dir / f"error_heatmap_epoch-{epoch}.png",
+            title=f"CacheHead vs frozen Wan · epoch {epoch} · {len(captions)} prompts",
+        )
+        save_error_arrays(result, out_dir / f"error_heatmap_epoch-{epoch}.pt")
+        print(f"[epoch {epoch}] wrote {png}")
+        if wandb_run is not None:
+            try:
+                import wandb
+
+                wandb_run.log({"error_heatmap": wandb.Image(str(png)), "epoch": epoch})
+            except Exception as exc:                      # logging must not kill a run
+                print(f"[epoch {epoch}] W&B heat-map upload skipped: {exc}")
+
+    return hook
 
 
 def initialize_wandb(args: argparse.Namespace, distributed: DistributedContext) -> Any | None:

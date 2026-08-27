@@ -73,6 +73,28 @@ class DistributedContext:
         dist.all_reduce(result, op=dist.ReduceOp.MAX)
         return int(result.item())
 
+    def min_int(self, value: int) -> int:
+        """Synchronize a loop count to the minimum requested by any rank.
+
+        Ranks hold disjoint prompt shards that can differ in length by one, so
+        an epoch must run the smallest common number of optimizer steps.  A
+        rank that ran extra steps would block forever in DDP's gradient
+        all-reduce waiting for peers that had already finished the epoch.
+        """
+        if not self.enabled:
+            return value
+        result = torch.tensor(value, device=self.device, dtype=torch.int64)
+        dist.all_reduce(result, op=dist.ReduceOp.MIN)
+        return int(result.item())
+
+    def mean_float(self, value: float) -> float:
+        """Average a scalar metric (e.g. validation loss) across all ranks."""
+        if not self.enabled:
+            return float(value)
+        result = torch.tensor(float(value), device=self.device, dtype=torch.float64)
+        dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        return float(result.item() / self.world_size)
+
     def barrier(self) -> None:
         if self.enabled:
             dist.barrier()

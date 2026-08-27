@@ -25,7 +25,8 @@ MotionCache, token selection, or selector training is used.
 | `fake_score_wan.py` | Strict-DMD fake-score estimator: a LoRA Wan (frozen Wan DiT clone + trainable low-rank adapters). Training-only; never exported |
 | `download_mixkit_captions.py` | Downloads the upstream Open-Sora-Plan annotation JSON and extracts its 8,230 current MixKit captions into training JSONL |
 | `cache_head_model_inference.py` | Hybrid inference runner (`hybrid` / `full` / `carry` modes), 16-state trajectory capture |
-| `cache_head_model_training.py` | Training harness + loss study: `carry_previous`, `residual_regression`, `dmd`, `dmd_plus_reg` |
+| `cache_head_model_training.py` | Training harness + loss study: `carry_previous`, `residual_regression`, `supervised`, `dmd`, `dmd_plus_reg` |
+| `cache_head_error_heatmap.py` | Per-patch head-vs-teacher error heat maps over a full trajectory (panel grid + per-step summary curve) |
 | `pca_trajectory_eval.py` | Shared-PCA trajectory-difference artifacts (npz / png / metrics json) |
 | `cache_head_harness.py` | Agent harness loop: tamper-evident ledger, locked manifest, 7-invariant verify, runner, evaluate, review |
 | `tests/` | CPU-runnable tests (51 tests; no GPU or Wan weights needed) |
@@ -44,6 +45,27 @@ MotionCache, token selection, or selector training is used.
   per arm; bf16, AdamW, effective batch 8, gradient clipping 1.0, startup memory
   probe for micro-batch / accumulation.  DMD alternates 1 CacheHead update with
   4 fake-score updates.  Only CacheHead weights + config are exported.
+- The **`supervised`** arm runs a different loop from the DMD arms (the loop is
+  derived from `--arm`, not a separate switch):
+  - One batched hybrid rollout supervises **every** head step against frozen Wan
+    queried at that same hybrid state, so a rollout yields `10 × B` targets
+    instead of one.  The loss lives in noise-token space `[B, N, C]`; the
+    unpatchified latent only advances the scheduler.
+  - Prompts are batched (`--micro-batch`, which must divide `--batch-size`); the
+    startup probe reports the peak for that micro-batch and fails fast rather
+    than searching, so the effective batch is reproducible across runs and ranks.
+  - Epoch loop over the train split with per-epoch validation on the held-out
+    `val` split, per-head-step val loss, and a best-val checkpoint
+    (`cache_head_best.ckpt`).
+  - The prefix is the **hybrid student rollout** (the head drives prior head
+    steps), so states match deployment.  `--chain-run-grads` additionally
+    backpropagates through consecutive head-step runs.
+  - This arm skips the LoRA fake-score clone entirely, freeing ~2.6 GB (bf16)
+    for a larger micro-batch.
+- `--heatmap-every N` renders a per-patch error heat map every N epochs:
+  `‖v_head − v_teacher‖₂` over the 64 token channels, reshaped to the `(f, h, w)`
+  token grid, on one shared color scale across all 15 steps.  Read it against the
+  per-head-step val loss: the loss says *when* the head drifts, the map says *where*.
 
 ## Running
 
@@ -83,6 +105,21 @@ torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
     --wandb-project cache-head-dmd --wandb-run-name dmd-8xa100-run1
 
 # W&B records this as: dmd-8xa100-run1-YYYYMMDD-HHMMSS+ZZZZ
+
+# Supervised training on eight GPUs (batched rollouts, epoch + val loop)
+torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
+    --arm supervised --captions mixkit_captions.jsonl \
+    --epochs 20 --batch-size 8 --micro-batch 4 --reg-loss huber \
+    --val-subset 128 --heatmap-every 5 --precision bf16 \
+    --save-dir runs/supervised \
+    --wandb-project cache-head-supervised
+
+# Find the largest micro-batch first: raise it until the startup probe OOMs,
+# then step back one.  --batch-size must stay a multiple of --micro-batch.
+
+# Standalone error heat map from a checkpoint (GPU)
+python cache_head_error_heatmap.py --checkpoint runs/supervised/cache_head_best.ckpt \
+    --captions mixkit_captions.jsonl --num-prompts 2 --out-dir heatmaps
 
 # PCA trajectory-difference evaluation (GPU)
 python pca_trajectory_eval.py --checkpoint out/cache_head_final.ckpt \
