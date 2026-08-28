@@ -165,7 +165,13 @@ class TimestepAdaLN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        emb = sinusoidal_embedding_1d(self.freq_dim, timestep)  # [B, freq_dim]
+        emb = sinusoidal_embedding_1d(self.freq_dim, timestep)  # [B, freq_dim], float32
+        # The embedding is built in float32 for precision, but the projection
+        # weights follow the model dtype (bf16 under --precision bf16) and
+        # F.linear requires both operands to match -- otherwise this raises
+        # "mat1 and mat2 must have the same dtype".  Wan's own DiT casts at the
+        # same point: sinusoidal_embedding_1d(...).to(x.dtype).
+        emb = emb.to(self.net[0].weight.dtype)
         scale, shift = self.net(emb).chunk(2, dim=-1)  # each [B, C]
         scale = self.dropout(scale).unsqueeze(1)
         shift = self.dropout(shift).unsqueeze(1)
