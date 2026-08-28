@@ -32,6 +32,7 @@ import argparse
 from datetime import datetime
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any, Callable
@@ -809,6 +810,14 @@ def main() -> None:
     parser.add_argument("--arm", choices=list(TRAINING_ARMS), required=True)
     parser.add_argument("--captions", required=True, help="MixKit caption JSONL path")
     parser.add_argument("--model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
+    parser.add_argument("--no-network", action="store_true",
+                        help="offline mode: never contact modelscope/HuggingFace/W&B. "
+                             "Model files must already sit under "
+                             "--model-base-path/<model-id>/ (see --model-base-path)")
+    parser.add_argument("--model-base-path", default=None,
+                        help="local model root for --no-network; weights are read from "
+                             "<path>/<model-id>/... (default: DIFFSYNTH_MODEL_BASE_PATH, "
+                             "else ./models)")
     parser.add_argument("--subset", type=int, default=1024, help="train subset (first proof: 1024)")
     parser.add_argument("--warmup-steps", type=int, default=2000)
     parser.add_argument("--updates", type=int, default=10000)
@@ -870,6 +879,12 @@ def main() -> None:
         help="Weights & Biases mode when --wandb-project is set",
     )
     args = parser.parse_args()
+    # W&B in online mode is an outbound call like any other.  Offline mode is
+    # still usable (it writes a local run to sync later), so only the modes that
+    # actually need the network are turned off.
+    if args.no_network and args.wandb_project and args.wandb_mode != "offline":
+        print("[no-network] disabling W&B (pass --wandb-mode offline to keep local logging)")
+        args.wandb_project = None
     args.wandb_start_time = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S%z")
     if args.wandb_run_name:
         args.wandb_run_name = f"{args.wandb_run_name}-{args.wandb_start_time}"
@@ -889,6 +904,8 @@ def main() -> None:
     if args.log_interval <= 0:
         parser.error("--log-interval must be positive")
 
+    apply_no_network(args)
+
     distributed = initialize_distributed(args.device)
     try:
         run_training(args, distributed)
@@ -907,15 +924,18 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
+    # Explicit as well as via the environment: skip_download=True short-circuits
+    # ModelConfig.require_downloading() regardless of how the env is configured.
+    model_kwargs = {"skip_download": True} if args.no_network else {}
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=dtype,
         device=device,
         model_configs=[
-            ModelConfig(model_id=args.model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors"),
-            ModelConfig(model_id=args.model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
-            ModelConfig(model_id=args.model_id, origin_file_pattern="Wan2.1_VAE.pth"),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors", **model_kwargs),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", **model_kwargs),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="Wan2.1_VAE.pth", **model_kwargs),
         ],
-        tokenizer_config=ModelConfig(model_id=args.model_id, origin_file_pattern="google/umt5-xxl/"),
+        tokenizer_config=ModelConfig(model_id=args.model_id, origin_file_pattern="google/umt5-xxl/", **model_kwargs),
     )
     dit = pipe.dit
     set_to_torch_norm([dit])
@@ -1029,6 +1049,32 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+
+
+def apply_no_network(args: argparse.Namespace) -> None:
+    """Resolve every model from local disk and make no outbound requests.
+
+    ``ModelConfig.download_if_necessary`` only calls the hub when
+    ``require_downloading()`` is true; with downloads skipped it falls through
+    to globbing ``<model-base-path>/<model_id>/<origin_file_pattern>``.  The
+    Hugging Face variables cover the tokenizer, which loads through
+    ``AutoTokenizer.from_pretrained`` and would otherwise still try to reach the
+    hub for a revision check.
+
+    Must run before the deferred ``diffsynth`` / ``transformers`` imports in
+    ``run_training``, which is why it is called from ``main``.
+    """
+    if not args.no_network:
+        return
+    os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "true"
+    if args.model_base_path:
+        os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = args.model_base_path
+    # setdefault: never override an offline setup the operator already made.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    base = os.environ.get("DIFFSYNTH_MODEL_BASE_PATH", "./models")
+    print(f"[no-network] downloads disabled; resolving models under {base}/<model_id>/")
 
 
 def build_heatmap_hook(

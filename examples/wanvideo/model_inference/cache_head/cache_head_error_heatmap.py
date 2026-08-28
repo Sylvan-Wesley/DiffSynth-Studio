@@ -270,7 +270,18 @@ def main() -> None:
     parser.add_argument("--frame", type=int, default=None,
                         help="latent frame to show (default: average over frames)")
     parser.add_argument("--out-dir", default="cache_head_heatmaps")
+    parser.add_argument("--no-network", action="store_true",
+                        help="offline mode: never contact modelscope/HuggingFace. "
+                             "Model files must already sit under "
+                             "--model-base-path/<model-id>/")
+    parser.add_argument("--model-base-path", default=None,
+                        help="local model root for --no-network (default: "
+                             "DIFFSYNTH_MODEL_BASE_PATH, else ./models)")
     args = parser.parse_args()
+
+    # Must precede the diffsynth/transformers imports below.
+    from cache_head_model_training import apply_no_network
+    apply_no_network(args)
 
     from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
     from diffsynth.models.wan_video_dit import set_to_torch_norm
@@ -280,15 +291,16 @@ def main() -> None:
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     torch.manual_seed(args.seed)
 
+    model_kwargs = {"skip_download": True} if args.no_network else {}
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=dtype,
         device=device,
         model_configs=[
-            ModelConfig(model_id=args.model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors"),
-            ModelConfig(model_id=args.model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
-            ModelConfig(model_id=args.model_id, origin_file_pattern="Wan2.1_VAE.pth"),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors", **model_kwargs),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", **model_kwargs),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="Wan2.1_VAE.pth", **model_kwargs),
         ],
-        tokenizer_config=ModelConfig(model_id=args.model_id, origin_file_pattern="google/umt5-xxl/"),
+        tokenizer_config=ModelConfig(model_id=args.model_id, origin_file_pattern="google/umt5-xxl/", **model_kwargs),
     )
     dit = pipe.dit
     set_to_torch_norm([dit])

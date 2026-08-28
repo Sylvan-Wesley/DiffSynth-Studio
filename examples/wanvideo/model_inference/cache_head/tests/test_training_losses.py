@@ -18,6 +18,7 @@ from cache_head_model_training import (
     id_hash_split,
     prompt_split_checksum,
     regression_loss,
+    apply_no_network,
     training_type_for_arm,
 )
 from fake_score_wan import FakeScoreWan
@@ -446,3 +447,53 @@ def test_supervised_epoch_needs_enough_prompts():
     trainer = _make_trainer("supervised", batch_size=8, micro_batch=2)
     with pytest.raises(ValueError, match="at least"):
         trainer.train(log_interval=1000)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Offline (--no-network) mode
+# ═══════════════════════════════════════════════════════════════
+
+import argparse
+import os
+
+
+def _clear_offline_env(monkeypatch):
+    for key in ("DIFFSYNTH_SKIP_DOWNLOAD", "DIFFSYNTH_MODEL_BASE_PATH",
+                "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_no_network_is_a_noop_when_disabled(monkeypatch):
+    _clear_offline_env(monkeypatch)
+    apply_no_network(argparse.Namespace(no_network=False, model_base_path=None))
+    assert "DIFFSYNTH_SKIP_DOWNLOAD" not in os.environ
+    assert "HF_HUB_OFFLINE" not in os.environ
+
+
+def test_no_network_disables_downloads_and_hub_lookups(monkeypatch):
+    _clear_offline_env(monkeypatch)
+    apply_no_network(argparse.Namespace(no_network=True, model_base_path="/data/wan"))
+    # ModelConfig.parse_skip_download() reads this and short-circuits download().
+    assert os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] == "true"
+    # ModelConfig.reset_local_model_path() reads this to resolve <base>/<model_id>/.
+    assert os.environ["DIFFSYNTH_MODEL_BASE_PATH"] == "/data/wan"
+    # The tokenizer loads via AutoTokenizer and would otherwise revision-check.
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_no_network_respects_an_existing_offline_setup(monkeypatch):
+    """Never override what the operator already configured."""
+    _clear_offline_env(monkeypatch)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    apply_no_network(argparse.Namespace(no_network=True, model_base_path=None))
+    assert os.environ["HF_HUB_OFFLINE"] == "0"
+    # ...but the download switch is ours to own.
+    assert os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] == "true"
+
+
+def test_no_network_leaves_model_base_path_unset_when_not_given(monkeypatch):
+    _clear_offline_env(monkeypatch)
+    apply_no_network(argparse.Namespace(no_network=True, model_base_path=None))
+    # ModelConfig falls back to its own default (./models).
+    assert "DIFFSYNTH_MODEL_BASE_PATH" not in os.environ

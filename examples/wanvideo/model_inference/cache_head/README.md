@@ -62,6 +62,13 @@ MotionCache, token selection, or selector training is used.
     backpropagates through consecutive head-step runs.
   - This arm skips the LoRA fake-score clone entirely, freeing ~2.6 GB (bf16)
     for a larger micro-batch.
+- `--no-network` runs fully offline: it sets `DIFFSYNTH_SKIP_DOWNLOAD=true` (so
+  `ModelConfig.download_if_necessary` resolves `<base>/<model_id>/<pattern>` by
+  glob instead of calling modelscope), passes `skip_download=True` on every
+  `ModelConfig`, sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` (the umt5
+  tokenizer loads through `AutoTokenizer.from_pretrained` and would otherwise
+  revision-check), and turns W&B off unless `--wandb-mode offline` is given.
+  Point `--model-base-path` at the directory *containing* `<model-id>/`.
 - `--heatmap-every N` renders a per-patch error heat map every N epochs:
   `‖v_head − v_teacher‖₂` over the 64 token channels, reshaped to the `(f, h, w)`
   token grid, on one shared color scale across all 15 steps.  Read it against the
@@ -116,6 +123,17 @@ torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
 
 # Find the largest micro-batch first: raise it until the startup probe OOMs,
 # then step back one.  --batch-size must stay a multiple of --micro-batch.
+
+# Offline / air-gapped box: no modelscope, no HuggingFace, no W&B.
+# Weights must already sit at <model-base-path>/<model-id>/, e.g.
+#   /data/wan_models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model*.safetensors
+#   /data/wan_models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+#   /data/wan_models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+#   /data/wan_models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/
+torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
+    --arm supervised --captions mixkit_captions.jsonl \
+    --no-network --model-base-path /data/wan_models \
+    --epochs 20 --batch-size 8 --micro-batch 4 --save-dir runs/supervised
 
 # Standalone error heat map from a checkpoint (GPU)
 python cache_head_error_heatmap.py --checkpoint runs/supervised/cache_head_best.ckpt \
