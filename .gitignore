@@ -1,4 +1,5 @@
 /data
+*.jsonl
 /models
 /scripts
 /diffusers
