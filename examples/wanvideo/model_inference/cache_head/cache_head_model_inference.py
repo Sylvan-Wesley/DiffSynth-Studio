@@ -168,7 +168,33 @@ def _save_trajectory(npz_path, states, scheduler, method, prompt_id, seed):
     return npz_path
 
 
+def check_checkpoint(checkpoint: str | None) -> None:
+    """Fail loudly, and early, on a ``--checkpoint`` that does not exist.
+
+    Silently falling back to a zero-init head makes the run identical to
+    ``carry_previous`` -- and identical across every checkpoint you point at,
+    which reads as "the head does nothing" rather than "the path is wrong".
+    Checked before Wan is loaded so a typo costs a second, not a model load.
+    """
+    if not checkpoint:
+        return
+    ckpt = Path(checkpoint)
+    if ckpt.is_file():
+        return
+    available = sorted(q.name for q in ckpt.parent.glob("*.ckpt")) if ckpt.parent.is_dir() else []
+    hint = (f"\n  Found in {ckpt.parent}: {', '.join(available)}" if available
+            else f"\n  No .ckpt files in {ckpt.parent}")
+    raise FileNotFoundError(
+        f"--checkpoint {ckpt} does not exist.{hint}\n"
+        f"  Training writes cache_head_step-<N>.ckpt, cache_head_final.ckpt, and "
+        f"(supervised arm) cache_head_best.ckpt.\n"
+        f"  Omit --checkpoint, or pass --mode carry, to run the zero-init baseline."
+    )
+
+
 def run_pipeline(args) -> None:
+    check_checkpoint(getattr(args, "checkpoint", None))
+
     from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
     from diffsynth.models.wan_video_dit import set_to_torch_norm
     from diffsynth.utils.data import save_video
@@ -195,7 +221,7 @@ def run_pipeline(args) -> None:
 
     # Head + config.
     config = None
-    if args.checkpoint and Path(args.checkpoint).is_file():
+    if args.checkpoint:
         head, config = load_cache_head(args.checkpoint, device=device, dtype=dtype)
         print(f"Loaded CacheHead from {args.checkpoint} (cfg={config.cfg_scale})")
     else:

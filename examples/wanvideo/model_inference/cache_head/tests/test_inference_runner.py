@@ -183,3 +183,40 @@ def test_full_mode_all_full_calls():
     assert stats["head_calls"] == 0
     assert dit.calls == 30
     assert len(states) == 16
+
+
+# ═══════════════════════════════════════════════════════════════
+# --checkpoint must not silently degrade to carry_previous
+# ═══════════════════════════════════════════════════════════════
+
+def test_missing_checkpoint_raises_instead_of_falling_back(tmp_path):
+    """A wrong --checkpoint path used to load a zero-init head silently, which
+    makes every checkpoint produce byte-identical output."""
+    from cache_head_model_inference import check_checkpoint
+    from cache_head_model import CacheHead, CacheHeadConfig, save_cache_head
+
+    cfg = CacheHeadConfig()
+    save_cache_head(CacheHead(cfg), cfg, tmp_path / "cache_head_step-200.ckpt")
+
+    with pytest.raises(FileNotFoundError) as exc:
+        check_checkpoint(str(tmp_path / "cache_head_200.ckpt"))
+    # The message must name what is actually on disk.
+    assert "cache_head_step-200.ckpt" in str(exc.value)
+
+
+def test_existing_checkpoint_and_no_checkpoint_both_pass(tmp_path):
+    from cache_head_model_inference import check_checkpoint
+    from cache_head_model import CacheHead, CacheHeadConfig, save_cache_head
+
+    cfg = CacheHeadConfig()
+    path = tmp_path / "cache_head_final.ckpt"
+    save_cache_head(CacheHead(cfg), cfg, path)
+    check_checkpoint(str(path))   # present -> fine
+    check_checkpoint(None)        # omitted -> zero-init baseline is intentional
+
+
+def test_missing_checkpoint_in_missing_directory_still_raises(tmp_path):
+    from cache_head_model_inference import check_checkpoint
+
+    with pytest.raises(FileNotFoundError, match="No .ckpt files"):
+        check_checkpoint(str(tmp_path / "nope" / "cache_head_final.ckpt"))
