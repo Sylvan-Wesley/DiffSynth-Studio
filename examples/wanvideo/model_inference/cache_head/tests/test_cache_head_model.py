@@ -240,3 +240,27 @@ def test_head_accepts_a_float32_timestep_in_a_bf16_model():
     out = head(tokens, torch.tensor([999.0], dtype=torch.float32), (2, 3, 4))
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out.float()).all()
+
+
+def test_checkpoint_round_trip_preserves_dtype():
+    """load_cache_head must hand back a head in the pipeline's dtype.
+
+    CacheHead is built in float32 and load_state_dict copies into those
+    parameters, so without an explicit dtype a bf16 checkpoint returns float32,
+    the head emits float32 tokens, the scheduler promotes the latents, and the
+    next full step feeds float32 activations to a bf16 Wan.
+    """
+    import tempfile
+
+    cfg = CacheHeadConfig()
+    head = CacheHead(cfg).to(dtype=torch.bfloat16)
+    path = os.path.join(tempfile.mkdtemp(), "head.ckpt")
+    save_cache_head(head, cfg, path)
+
+    stored = torch.load(path, weights_only=False)["model_state_dict"]
+    assert stored["out_proj.weight"].dtype == torch.bfloat16
+
+    loaded, _ = load_cache_head(path, dtype=torch.bfloat16)
+    assert next(loaded.parameters()).dtype == torch.bfloat16
+    tokens = torch.randn(1, 24, 64, dtype=torch.bfloat16)
+    assert loaded(tokens, torch.tensor([500.0]), (2, 3, 4)).dtype == torch.bfloat16

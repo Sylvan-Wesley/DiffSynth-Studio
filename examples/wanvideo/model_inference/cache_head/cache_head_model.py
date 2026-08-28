@@ -308,8 +308,20 @@ def save_cache_head(head: nn.Module, config: CacheHeadConfig, path: str | Path) 
     return path
 
 
-def load_cache_head(path: str | Path, device: torch.device | str = "cpu") -> tuple[CacheHead, CacheHeadConfig]:
-    """Rebuild a CacheHead and its config from a checkpoint."""
+def load_cache_head(
+    path: str | Path,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype | None = None,
+) -> tuple[CacheHead, CacheHeadConfig]:
+    """Rebuild a CacheHead and its config from a checkpoint.
+
+    ``dtype`` must match the pipeline the head will run inside.  ``CacheHead``
+    is constructed in float32 and ``load_state_dict`` copies *into* those
+    parameters, so a bf16 checkpoint silently comes back as float32; the head
+    then emits float32 tokens, the scheduler promotes the latents to float32,
+    and the next full step hands float32 activations to a bf16 Wan.  Pass the
+    pipeline dtype to keep the two in step.
+    """
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"CacheHead checkpoint not found: {path}")
@@ -323,6 +335,6 @@ def load_cache_head(path: str | Path, device: torch.device | str = "cpu") -> tup
     )
     head = CacheHead(config)
     head.load_state_dict(payload["model_state_dict"])
-    head.to(device)
+    head.to(device=device) if dtype is None else head.to(device=device, dtype=dtype)
     head.eval()
     return head, config

@@ -196,7 +196,7 @@ def run_pipeline(args) -> None:
     # Head + config.
     config = None
     if args.checkpoint and Path(args.checkpoint).is_file():
-        head, config = load_cache_head(args.checkpoint, device=device)
+        head, config = load_cache_head(args.checkpoint, device=device, dtype=dtype)
         print(f"Loaded CacheHead from {args.checkpoint} (cfg={config.cfg_scale})")
     else:
         config = CacheHeadConfig(model_id=args.model_id, cfg_scale=args.cfg)
