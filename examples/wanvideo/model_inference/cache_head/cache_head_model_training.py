@@ -483,7 +483,11 @@ class CacheHeadTrainer:
                         f"{expected_tokens + (WAN_NOISE_TOKEN_CHANNELS,)}, got "
                         f"head {tuple(v_tokens.shape)} vs teacher {tuple(teacher_tokens.shape)}"
                     )
-                step_loss = regression_loss(v_tokens, teacher_tokens, self.reg_loss)
+                # Accumulate in float32: under --precision bf16 the loss comes
+                # back as bf16 (~3 decimal digits), and summing ten of them then
+                # dividing throws away precision in both the logged value and
+                # the gradient.  Autograd carries the cast back through.
+                step_loss = regression_loss(v_tokens, teacher_tokens, self.reg_loss).float()
                 total = step_loss if total is None else total + step_loss
                 per_step.append({"step": k, "loss": float(step_loss.detach().item())})
                 noise_pred = unpatchify_tokens(v_tokens, self.grid, self.patch)

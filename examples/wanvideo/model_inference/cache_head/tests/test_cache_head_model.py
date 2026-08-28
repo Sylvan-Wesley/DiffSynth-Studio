@@ -198,3 +198,45 @@ def test_checkpoint_round_trip():
 def test_checkpoint_missing_file():
     with pytest.raises(FileNotFoundError):
         load_cache_head("/nonexistent/path/head.ckpt")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Mixed precision
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_head_forward_runs_in_every_precision(dtype):
+    """The timestep embedding is built in float32 but the AdaLN projection
+    follows the model dtype; without a cast F.linear raises
+    "mat1 and mat2 must have the same dtype" on any --precision bf16 run.
+    """
+    head = CacheHead(CacheHeadConfig()).to(dtype=dtype)
+    tokens = torch.randn(2, 24, 64, dtype=dtype)
+    timestep = torch.tensor([999.0], dtype=dtype)
+    out = head(tokens, timestep, (2, 3, 4))
+    assert out.dtype == dtype
+    assert out.shape == tokens.shape
+    assert torch.isfinite(out.float()).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_head_backward_runs_in_low_precision(dtype):
+    head = CacheHead(CacheHeadConfig()).to(dtype=dtype)
+    # Zero-init out_proj means a fresh head has no gradient signal to speak of;
+    # perturb it so the backward actually exercises every parameter.
+    with torch.no_grad():
+        head.out_proj.weight.add_(0.05 * torch.randn_like(head.out_proj.weight))
+    tokens = torch.randn(1, 24, 64, dtype=dtype)
+    out = head(tokens, torch.tensor([500.0], dtype=dtype), (2, 3, 4))
+    out.float().pow(2).mean().backward()
+    assert all(p.grad is not None for p in head.parameters())
+
+
+def test_head_accepts_a_float32_timestep_in_a_bf16_model():
+    """Timesteps reach the head straight from the scheduler, which builds them
+    in float32 regardless of --precision."""
+    head = CacheHead(CacheHeadConfig()).to(dtype=torch.bfloat16)
+    tokens = torch.randn(1, 24, 64, dtype=torch.bfloat16)
+    out = head(tokens, torch.tensor([999.0], dtype=torch.float32), (2, 3, 4))
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out.float()).all()
