@@ -276,7 +276,7 @@ def test_hybrid_rollout_stays_bf16_end_to_end(tmp_path):
     final, states, stats = sampler.sample(latents, ctx, ctx)
 
     assert final.dtype == torch.bfloat16
-    assert stats == {"full_calls": 5, "head_calls": 10}
+    assert (stats["full_calls"], stats["head_calls"]) == (5, 10)
     assert len(states) == 16
 
 
@@ -296,3 +296,31 @@ def test_checkpoint_loaded_without_dtype_promotes_the_latents(tmp_path):
     # The documented hazard, and the fix for it.
     assert device_only(tokens, t, (2, 3, 4)).dtype == torch.float32
     assert with_dtype(tokens, t, (2, 3, 4)).dtype == torch.bfloat16
+
+
+def test_sample_reports_whether_the_head_changed_anything():
+    """A head whose residual is rounded away produces output identical to
+    carry_previous even though it loaded correctly, so the rollout has to
+    report its own effect rather than leave it to be inferred from the video.
+    """
+    schedule = CacheHeadSchedule(15, (1, 2, 6, 10, 14))
+    zero = CacheHead(CacheHeadConfig()).eval()          # exact carry_previous
+    sampler = HybridSampler(FakeDit(), FakeScheduler(15), zero, schedule,
+                            5.0, (1, 2, 2), (2, 3, 4))
+    latents = torch.randn(1, 16, 2, 6, 8)
+    ctx = torch.randn(1, 4, 8)
+    _, _, stats = sampler.sample(latents, ctx, ctx)
+
+    assert len(stats["head_tokens_changed"]) == 10
+    # Zero-init head: nothing changes, and the relative residual is exactly 0.
+    assert all(c == 0.0 for c in stats["head_tokens_changed"])
+    assert all(r == 0.0 for r in stats["head_residual_rel"])
+
+    trained = CacheHead(CacheHeadConfig())
+    with torch.no_grad():
+        trained.out_proj.weight.add_(0.5 * torch.randn_like(trained.out_proj.weight))
+    sampler = HybridSampler(FakeDit(), FakeScheduler(15), trained.eval(), schedule,
+                            5.0, (1, 2, 2), (2, 3, 4))
+    _, _, stats = sampler.sample(latents, ctx, ctx)
+    assert all(c > 0.5 for c in stats["head_tokens_changed"])
+    assert all(r > 0.0 for r in stats["head_residual_rel"])
