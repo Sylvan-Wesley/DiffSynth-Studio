@@ -105,7 +105,9 @@ class HybridSampler:
         and ``stats`` counts full/head calls."""
         states = [latents.detach().float().cpu()]
         prev_guided = None
-        stats = {"full_calls": 0, "head_calls": 0}
+        stats = {"full_calls": 0, "head_calls": 0, "head_token_scale": [],
+                 "head_residual_abs": [], "head_residual_rel": [],
+                 "head_tokens_changed": []}
         timesteps = self.scheduler.timesteps
         for progress_id, timestep in enumerate(timesteps):
             t = timestep.reshape(1).to(device=latents.device, dtype=latents.dtype)
@@ -120,10 +122,25 @@ class HybridSampler:
                         f"head step at progress {progress_id} before any full step; "
                         f"invalid schedule {self.schedule}"
                     )
+                # Measure what the head actually contributed, before the add
+                # is committed.  CacheHead starts with RMSNorm, so |residual|
+                # does not scale with |prev_guided|: on large tokens the
+                # relative residual collapses and the low-precision add
+                # discards it outright, leaving output identical to
+                # carry_previous even though the head loaded correctly.
+                before = prev_guided
                 noise_pred, prev_guided = head_step(
                     self.head, t, prev_guided, self.grid, self.patch_size
                 )
+                residual = prev_guided - before
+                changed = (prev_guided != before).float().mean().item()
+                rel = (residual.float().abs().mean()
+                       / before.float().abs().mean().clamp_min(1e-12)).item()
                 stats["head_calls"] += 1
+                stats["head_token_scale"].append(before.float().abs().mean().item())
+                stats["head_residual_abs"].append(residual.float().abs().mean().item())
+                stats["head_residual_rel"].append(rel)
+                stats["head_tokens_changed"].append(changed)
             latents = self.scheduler.step(noise_pred, timestep, latents)
             states.append(latents.detach().float().cpu())
         return latents, states, stats
@@ -168,7 +185,33 @@ def _save_trajectory(npz_path, states, scheduler, method, prompt_id, seed):
     return npz_path
 
 
+def check_checkpoint(checkpoint: str | None) -> None:
+    """Fail loudly, and early, on a ``--checkpoint`` that does not exist.
+
+    Silently falling back to a zero-init head makes the run identical to
+    ``carry_previous`` -- and identical across every checkpoint you point at,
+    which reads as "the head does nothing" rather than "the path is wrong".
+    Checked before Wan is loaded so a typo costs a second, not a model load.
+    """
+    if not checkpoint:
+        return
+    ckpt = Path(checkpoint)
+    if ckpt.is_file():
+        return
+    available = sorted(q.name for q in ckpt.parent.glob("*.ckpt")) if ckpt.parent.is_dir() else []
+    hint = (f"\n  Found in {ckpt.parent}: {', '.join(available)}" if available
+            else f"\n  No .ckpt files in {ckpt.parent}")
+    raise FileNotFoundError(
+        f"--checkpoint {ckpt} does not exist.{hint}\n"
+        f"  Training writes cache_head_step-<N>.ckpt, cache_head_final.ckpt, and "
+        f"(supervised arm) cache_head_best.ckpt.\n"
+        f"  Omit --checkpoint, or pass --mode carry, to run the zero-init baseline."
+    )
+
+
 def run_pipeline(args) -> None:
+    check_checkpoint(getattr(args, "checkpoint", None))
+
     from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
     from diffsynth.models.wan_video_dit import set_to_torch_norm
     from diffsynth.utils.data import save_video
@@ -195,8 +238,8 @@ def run_pipeline(args) -> None:
 
     # Head + config.
     config = None
-    if args.checkpoint and Path(args.checkpoint).is_file():
-        head, config = load_cache_head(args.checkpoint, device=device)
+    if args.checkpoint:
+        head, config = load_cache_head(args.checkpoint, device=device, dtype=dtype)
         print(f"Loaded CacheHead from {args.checkpoint} (cfg={config.cfg_scale})")
     else:
         config = CacheHeadConfig(model_id=args.model_id, cfg_scale=args.cfg)
@@ -261,7 +304,20 @@ def run_pipeline(args) -> None:
     final_latents, states, stats = sampler.sample(latents, ctx_posi, ctx_nega)
     torch.cuda.synchronize() if device == "cuda" else None
     elapsed = time.perf_counter() - t_start
-    print(f"Sampling done in {elapsed:.2f}s: {stats} "
+    if stats["head_calls"]:
+        changed = sum(stats["head_tokens_changed"]) / stats["head_calls"]
+        print(f"[head effect] mean |tokens|={sum(stats['head_token_scale'])/stats['head_calls']:.3e}  "
+              f"mean |residual|={sum(stats['head_residual_abs'])/stats['head_calls']:.3e}  "
+              f"relative={sum(stats['head_residual_rel'])/stats['head_calls']:.3e}")
+        print(f"[head effect] {changed * 100:.2f}% of tokens changed by the head")
+        if changed < 0.01:
+            print("[head effect] WARNING: the head is a no-op at this precision -- "
+                  "output will match carry_previous.  Either the head is far from "
+                  "converged, or |residual| is too small to survive the add "
+                  "(CacheHead is RMSNorm-fronted, so |residual| does not grow with "
+                  "|tokens|).  Re-run with --precision fp32 to separate the two.")
+    counts = {k: stats[k] for k in ("full_calls", "head_calls")}
+    print(f"Sampling done in {elapsed:.2f}s: {counts} "
           f"({elapsed / schedule.num_inference_steps * 1000:.0f} ms/step)")
 
     if args.trajectory:

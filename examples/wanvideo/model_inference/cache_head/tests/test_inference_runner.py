@@ -183,3 +183,144 @@ def test_full_mode_all_full_calls():
     assert stats["head_calls"] == 0
     assert dit.calls == 30
     assert len(states) == 16
+
+
+# ═══════════════════════════════════════════════════════════════
+# --checkpoint must not silently degrade to carry_previous
+# ═══════════════════════════════════════════════════════════════
+
+def test_missing_checkpoint_raises_instead_of_falling_back(tmp_path):
+    """A wrong --checkpoint path used to load a zero-init head silently, which
+    makes every checkpoint produce byte-identical output."""
+    from cache_head_model_inference import check_checkpoint
+    from cache_head_model import CacheHead, CacheHeadConfig, save_cache_head
+
+    cfg = CacheHeadConfig()
+    save_cache_head(CacheHead(cfg), cfg, tmp_path / "cache_head_step-200.ckpt")
+
+    with pytest.raises(FileNotFoundError) as exc:
+        check_checkpoint(str(tmp_path / "cache_head_200.ckpt"))
+    # The message must name what is actually on disk.
+    assert "cache_head_step-200.ckpt" in str(exc.value)
+
+
+def test_existing_checkpoint_and_no_checkpoint_both_pass(tmp_path):
+    from cache_head_model_inference import check_checkpoint
+    from cache_head_model import CacheHead, CacheHeadConfig, save_cache_head
+
+    cfg = CacheHeadConfig()
+    path = tmp_path / "cache_head_final.ckpt"
+    save_cache_head(CacheHead(cfg), cfg, path)
+    check_checkpoint(str(path))   # present -> fine
+    check_checkpoint(None)        # omitted -> zero-init baseline is intentional
+
+
+def test_missing_checkpoint_in_missing_directory_still_raises(tmp_path):
+    from cache_head_model_inference import check_checkpoint
+
+    with pytest.raises(FileNotFoundError, match="No .ckpt files"):
+        check_checkpoint(str(tmp_path / "nope" / "cache_head_final.ckpt"))
+
+
+# ═══════════════════════════════════════════════════════════════
+# bf16 end-to-end: the head must not promote the latents
+# ═══════════════════════════════════════════════════════════════
+
+class StrictDtypeDit(torch.nn.Module):
+    """Stand-in for Wan that refuses any input not in its own dtype.
+
+    Real Wan fails the same way, several frames deep in
+    time_embedding -> F.linear, with "mat1 and mat2 must have the same dtype".
+    """
+
+    def __init__(self, dtype=torch.bfloat16, grid=(2, 3, 4), patch=(1, 2, 2)):
+        super().__init__()
+        self.dtype = dtype
+        self.grid = grid
+        self.patch = patch
+        self.patch_embedding = torch.nn.Conv3d(16, 64, patch, patch, bias=False).to(dtype)
+        self.calls = 0
+
+    def forward(self, x, timestep, context, return_noise_tokens=False, **kwargs):
+        if x.dtype != self.dtype:
+            raise RuntimeError(
+                f"mat1 and mat2 must have the same dtype, but got {x.dtype} and {self.dtype}"
+            )
+        self.calls += 1
+        tokens = einops.rearrange(self.patch_embedding(x), "b d f h w -> b (f h w) d")
+        noise_pred = unpatchify_tokens(tokens, self.grid, self.patch)
+        return (noise_pred, tokens) if return_noise_tokens else noise_pred
+
+
+def test_hybrid_rollout_stays_bf16_end_to_end(tmp_path):
+    """A checkpoint loaded without its dtype yields a float32 head, whose tokens
+    promote the latents on the first head step and blow up at the next full
+    step.  The whole rollout has to stay in the pipeline dtype.
+    """
+    from cache_head_model import save_cache_head, load_cache_head
+
+    cfg = CacheHeadConfig()
+    head = CacheHead(cfg).to(torch.bfloat16)
+    with torch.no_grad():
+        head.out_proj.weight.add_(0.05 * torch.randn_like(head.out_proj.weight))
+    path = tmp_path / "head.ckpt"
+    save_cache_head(head, cfg, path)
+
+    loaded, _ = load_cache_head(path, dtype=torch.bfloat16)
+    sampler = HybridSampler(
+        StrictDtypeDit(), FakeScheduler(15), loaded,
+        CacheHeadSchedule(15, (1, 2, 6, 10, 14)), 5.0, (1, 2, 2), (2, 3, 4),
+    )
+    latents = torch.randn(1, 16, 2, 6, 8, dtype=torch.bfloat16)
+    ctx = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+    final, states, stats = sampler.sample(latents, ctx, ctx)
+
+    assert final.dtype == torch.bfloat16
+    assert (stats["full_calls"], stats["head_calls"]) == (5, 10)
+    assert len(states) == 16
+
+
+def test_checkpoint_loaded_without_dtype_promotes_the_latents(tmp_path):
+    """Guards the regression directly: device-only load must not silently
+    hand back a float32 head for a bf16 checkpoint."""
+    from cache_head_model import save_cache_head, load_cache_head
+
+    cfg = CacheHeadConfig()
+    path = tmp_path / "head.ckpt"
+    save_cache_head(CacheHead(cfg).to(torch.bfloat16), cfg, path)
+
+    device_only, _ = load_cache_head(path)
+    with_dtype, _ = load_cache_head(path, dtype=torch.bfloat16)
+    tokens = torch.randn(1, 24, 64, dtype=torch.bfloat16)
+    t = torch.tensor([500.0])
+    # The documented hazard, and the fix for it.
+    assert device_only(tokens, t, (2, 3, 4)).dtype == torch.float32
+    assert with_dtype(tokens, t, (2, 3, 4)).dtype == torch.bfloat16
+
+
+def test_sample_reports_whether_the_head_changed_anything():
+    """A head whose residual is rounded away produces output identical to
+    carry_previous even though it loaded correctly, so the rollout has to
+    report its own effect rather than leave it to be inferred from the video.
+    """
+    schedule = CacheHeadSchedule(15, (1, 2, 6, 10, 14))
+    zero = CacheHead(CacheHeadConfig()).eval()          # exact carry_previous
+    sampler = HybridSampler(FakeDit(), FakeScheduler(15), zero, schedule,
+                            5.0, (1, 2, 2), (2, 3, 4))
+    latents = torch.randn(1, 16, 2, 6, 8)
+    ctx = torch.randn(1, 4, 8)
+    _, _, stats = sampler.sample(latents, ctx, ctx)
+
+    assert len(stats["head_tokens_changed"]) == 10
+    # Zero-init head: nothing changes, and the relative residual is exactly 0.
+    assert all(c == 0.0 for c in stats["head_tokens_changed"])
+    assert all(r == 0.0 for r in stats["head_residual_rel"])
+
+    trained = CacheHead(CacheHeadConfig())
+    with torch.no_grad():
+        trained.out_proj.weight.add_(0.5 * torch.randn_like(trained.out_proj.weight))
+    sampler = HybridSampler(FakeDit(), FakeScheduler(15), trained.eval(), schedule,
+                            5.0, (1, 2, 2), (2, 3, 4))
+    _, _, stats = sampler.sample(latents, ctx, ctx)
+    assert all(c > 0.5 for c in stats["head_tokens_changed"])
+    assert all(r > 0.0 for r in stats["head_residual_rel"])

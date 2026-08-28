@@ -198,3 +198,69 @@ def test_checkpoint_round_trip():
 def test_checkpoint_missing_file():
     with pytest.raises(FileNotFoundError):
         load_cache_head("/nonexistent/path/head.ckpt")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Mixed precision
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_head_forward_runs_in_every_precision(dtype):
+    """The timestep embedding is built in float32 but the AdaLN projection
+    follows the model dtype; without a cast F.linear raises
+    "mat1 and mat2 must have the same dtype" on any --precision bf16 run.
+    """
+    head = CacheHead(CacheHeadConfig()).to(dtype=dtype)
+    tokens = torch.randn(2, 24, 64, dtype=dtype)
+    timestep = torch.tensor([999.0], dtype=dtype)
+    out = head(tokens, timestep, (2, 3, 4))
+    assert out.dtype == dtype
+    assert out.shape == tokens.shape
+    assert torch.isfinite(out.float()).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_head_backward_runs_in_low_precision(dtype):
+    head = CacheHead(CacheHeadConfig()).to(dtype=dtype)
+    # Zero-init out_proj means a fresh head has no gradient signal to speak of;
+    # perturb it so the backward actually exercises every parameter.
+    with torch.no_grad():
+        head.out_proj.weight.add_(0.05 * torch.randn_like(head.out_proj.weight))
+    tokens = torch.randn(1, 24, 64, dtype=dtype)
+    out = head(tokens, torch.tensor([500.0], dtype=dtype), (2, 3, 4))
+    out.float().pow(2).mean().backward()
+    assert all(p.grad is not None for p in head.parameters())
+
+
+def test_head_accepts_a_float32_timestep_in_a_bf16_model():
+    """Timesteps reach the head straight from the scheduler, which builds them
+    in float32 regardless of --precision."""
+    head = CacheHead(CacheHeadConfig()).to(dtype=torch.bfloat16)
+    tokens = torch.randn(1, 24, 64, dtype=torch.bfloat16)
+    out = head(tokens, torch.tensor([999.0], dtype=torch.float32), (2, 3, 4))
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out.float()).all()
+
+
+def test_checkpoint_round_trip_preserves_dtype():
+    """load_cache_head must hand back a head in the pipeline's dtype.
+
+    CacheHead is built in float32 and load_state_dict copies into those
+    parameters, so without an explicit dtype a bf16 checkpoint returns float32,
+    the head emits float32 tokens, the scheduler promotes the latents, and the
+    next full step feeds float32 activations to a bf16 Wan.
+    """
+    import tempfile
+
+    cfg = CacheHeadConfig()
+    head = CacheHead(cfg).to(dtype=torch.bfloat16)
+    path = os.path.join(tempfile.mkdtemp(), "head.ckpt")
+    save_cache_head(head, cfg, path)
+
+    stored = torch.load(path, weights_only=False)["model_state_dict"]
+    assert stored["out_proj.weight"].dtype == torch.bfloat16
+
+    loaded, _ = load_cache_head(path, dtype=torch.bfloat16)
+    assert next(loaded.parameters()).dtype == torch.bfloat16
+    tokens = torch.randn(1, 24, 64, dtype=torch.bfloat16)
+    assert loaded(tokens, torch.tensor([500.0]), (2, 3, 4)).dtype == torch.bfloat16
