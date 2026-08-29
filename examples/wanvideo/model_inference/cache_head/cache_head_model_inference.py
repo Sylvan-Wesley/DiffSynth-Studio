@@ -379,6 +379,7 @@ def run_pipeline(args) -> None:
     if args.output:
         if device == "cuda":
             torch.cuda.empty_cache()
+        pipe.vae = pipe.vae.to("cuda")
         video = pipe.vae.decode(
             final_latents.to(device=device),
             device=device,
