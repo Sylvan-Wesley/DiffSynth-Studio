@@ -55,11 +55,12 @@ def collect_step_errors(
     """Roll one hybrid trajectory, recording per-patch head-vs-teacher error.
 
     Returns a dict with
-        ``errors``      [num_steps, B, f, h, w] absolute L2 error per patch
-        ``rel_errors``  same, divided by the teacher's own token norm
-        ``is_head``     [num_steps] bool, True where the head drives the step
-        ``has_pred``    [num_steps] bool, False before the first full step
-        ``timesteps``   [num_steps] the Wan timestep at each step
+        ``errors``        [num_steps, B, f, h, w] absolute L2 error per patch
+        ``rel_errors``    same, divided by the teacher's own token norm
+        ``is_head``       [num_steps] bool, True where the head drives the step
+        ``has_pred``      [num_steps] bool, False before the first full step
+        ``timesteps``     [num_steps] the Wan timestep at each step
+        ``final_latents`` [B, C, F, H, W] the rollout's output, ready to decode
     """
     from cache_head_model import unpatchify_tokens  # local: keeps import graph flat
 
@@ -112,6 +113,9 @@ def collect_step_errors(
         "is_head": is_head,
         "has_pred": has_pred,
         "timesteps": timesteps,
+        # The heat map says where the head diverges; the video says whether it
+        # matters.  Same rollout, so the two always describe the same run.
+        "final_latents": latents,
     }
 
 
@@ -237,14 +241,52 @@ def render_error_heatmap(
 
 
 def save_error_arrays(result: dict, out_path: str | Path) -> Path:
-    """Persist the raw error tensor so panels can be re-rendered without Wan."""
+    """Persist the raw error tensors so panels can be re-rendered without Wan.
+
+    ``final_latents`` is deliberately excluded: it is large, lives on the
+    accelerator, and is already represented by the decoded video.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
-        {k: v for k, v in result.items()},
+        {k: v for k, v in result.items() if k != "final_latents"},
         out_path,
     )
     return out_path
+
+
+def save_rollout_video(
+    pipe, latents: torch.Tensor, out_path: str | Path, *, device, fps: int = 15,
+    quality: int = 5, tile_size=(30, 52), tile_stride=(15, 26),
+) -> list[Path]:
+    """Decode the rollout's latents and write one mp4 per prompt.
+
+    Mirrors the decode in ``cache_head_model_inference.run_pipeline`` so the
+    video beside a heat map is the same artifact the inference runner produces.
+    """
+    from diffsynth.utils.data import save_video
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    n_batch = latents.shape[0]
+    for i in range(n_batch):
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
+        video = pipe.vae.decode(
+            latents[i : i + 1].to(device=device),
+            device=device,
+            tiled=True,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+        # One prompt keeps the requested name; a batch gets an index suffix.
+        target = out_path if n_batch == 1 else out_path.with_name(
+            f"{out_path.stem}-{i}{out_path.suffix}"
+        )
+        save_video(pipe.vae_output_to_video(video), str(target), fps=fps, quality=quality)
+        written.append(target)
+    return written
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -270,6 +312,13 @@ def main() -> None:
     parser.add_argument("--frame", type=int, default=None,
                         help="latent frame to show (default: average over frames)")
     parser.add_argument("--out-dir", default="cache_head_heatmaps")
+    parser.add_argument("--video", default=None,
+                        help="path for the decoded rollout video "
+                             "(default: <out-dir>/rollout.mp4; one file per prompt, "
+                             "index-suffixed when --num-prompts > 1)")
+    parser.add_argument("--no-video", action="store_true",
+                        help="skip VAE decoding and write only the heat map")
+    parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--no-network", action="store_true",
                         help="offline mode: never contact modelscope/HuggingFace. "
                              "Model files must already sit under "
@@ -356,6 +405,13 @@ def main() -> None:
     pt = save_error_arrays(result, out_dir / "cache_head_error_heatmap.pt")
     print(f"wrote {png}")
     print(f"wrote {pt}")
+
+    if not args.no_video:
+        video_path = Path(args.video) if args.video else out_dir / "rollout.mp4"
+        for i, written in enumerate(save_rollout_video(
+            pipe, result["final_latents"], video_path, device=device, fps=args.fps,
+        )):
+            print(f"wrote {written}  <- {captions[i]!r}")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ MotionCache, token selection, or selector training is used.
 | `download_mixkit_captions.py` | Downloads the upstream Open-Sora-Plan annotation JSON and extracts its 8,230 current MixKit captions into training JSONL |
 | `cache_head_model_inference.py` | Hybrid inference runner (`hybrid` / `full` / `carry` modes), 16-state trajectory capture |
 | `cache_head_model_training.py` | Training harness + loss study: `carry_previous`, `residual_regression`, `supervised`, `dmd`, `dmd_plus_reg` |
-| `cache_head_error_heatmap.py` | Per-patch head-vs-teacher error heat maps over a full trajectory (panel grid + per-step summary curve) |
+| `cache_head_error_heatmap.py` | Per-patch head-vs-teacher error heat maps over a full trajectory (panel grid + per-step summary curve), plus the decoded video of that same rollout |
 | `pca_trajectory_eval.py` | Shared-PCA trajectory-difference artifacts (npz / png / metrics json) |
 | `cache_head_harness.py` | Agent harness loop: tamper-evident ledger, locked manifest, 7-invariant verify, runner, evaluate, review |
 | `tests/` | CPU-runnable tests (51 tests; no GPU or Wan weights needed) |
@@ -135,9 +135,14 @@ torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
     --no-network --model-base-path /data/wan_models \
     --epochs 20 --batch-size 8 --micro-batch 4 --save-dir runs/supervised
 
-# Standalone error heat map from a checkpoint (GPU)
+# Standalone error heat map from a checkpoint (GPU).  Writes the panel grid,
+# the raw error arrays, and the decoded video of the same rollout, so the
+# picture and the footage always describe one run.
 python cache_head_error_heatmap.py --checkpoint runs/supervised/cache_head_best.ckpt \
     --captions mixkit_captions.jsonl --num-prompts 2 --out-dir heatmaps
+#   heatmaps/cache_head_error_heatmap.png
+#   heatmaps/cache_head_error_heatmap.pt
+#   heatmaps/rollout-0.mp4, rollout-1.mp4      (--video PATH to rename, --no-video to skip)
 
 # PCA trajectory-difference evaluation (GPU)
 python pca_trajectory_eval.py --checkpoint out/cache_head_final.ckpt \

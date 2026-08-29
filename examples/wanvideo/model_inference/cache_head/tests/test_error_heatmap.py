@@ -111,3 +111,86 @@ def test_render_relative_and_single_frame(tmp_path):
     _, _, _, result = _collect()
     png = render_error_heatmap(result, tmp_path / "rel.png", relative=True, frame=0)
     assert png.is_file() and png.stat().st_size > 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# Rollout video
+# ═══════════════════════════════════════════════════════════════
+
+def test_collect_returns_final_latents_for_decoding():
+    _, _, _, result = _collect(n_batch=2)
+    assert result["final_latents"].shape == (2, *LATENT_SHAPE[1:])
+
+
+def test_saved_arrays_exclude_the_latents(tmp_path):
+    _, _, _, result = _collect()
+    pt = save_error_arrays(result, tmp_path / "e.pt")
+    reloaded = torch.load(pt, weights_only=False)
+    # Large, device-resident, and already represented by the video.
+    assert "final_latents" not in reloaded
+    assert "errors" in reloaded and "timesteps" in reloaded
+
+
+class _FakePipe:
+    """Minimal stand-in for WanVideoPipeline's decode surface."""
+
+    class _VAE:
+        def decode(self, latents, device=None, tiled=None, tile_size=None, tile_stride=None):
+            assert latents.shape[0] == 1, "decode one prompt at a time"
+            return latents
+
+    def __init__(self):
+        self.vae = self._VAE()
+
+    def vae_output_to_video(self, video):
+        return video
+
+
+def _stub_save_video(monkeypatch):
+    """Stub diffsynth.utils.data.save_video; it is imported inside the function."""
+    import sys, types
+
+    written = []
+    mod = types.ModuleType("diffsynth.utils.data")
+    mod.save_video = lambda frames, path, fps=15, quality=5: (
+        written.append(path), open(path, "wb").write(b"MP4")
+    )
+    monkeypatch.setitem(sys.modules, "diffsynth", types.ModuleType("diffsynth"))
+    monkeypatch.setitem(sys.modules, "diffsynth.utils", types.ModuleType("diffsynth.utils"))
+    monkeypatch.setitem(sys.modules, "diffsynth.utils.data", mod)
+    return written
+
+
+def test_single_prompt_keeps_the_requested_filename(tmp_path, monkeypatch):
+    from cache_head_error_heatmap import save_rollout_video
+
+    written = _stub_save_video(monkeypatch)
+    latents = torch.randn(1, *LATENT_SHAPE[1:])
+    out = save_rollout_video(_FakePipe(), latents, tmp_path / "rollout.mp4", device="cpu")
+
+    assert [p.name for p in out] == ["rollout.mp4"]
+    assert len(written) == 1
+    assert (tmp_path / "rollout.mp4").is_file()
+
+
+def test_batch_gets_one_indexed_file_per_prompt(tmp_path, monkeypatch):
+    from cache_head_error_heatmap import save_rollout_video
+
+    _stub_save_video(monkeypatch)
+    latents = torch.randn(3, *LATENT_SHAPE[1:])
+    out = save_rollout_video(_FakePipe(), latents, tmp_path / "rollout.mp4", device="cpu")
+
+    assert [p.name for p in out] == ["rollout-0.mp4", "rollout-1.mp4", "rollout-2.mp4"]
+    assert all(p.is_file() for p in out)
+
+
+def test_video_comes_from_the_same_rollout_as_the_heatmap(tmp_path, monkeypatch):
+    """The point of decoding here: the video and the panels describe one run."""
+    from cache_head_error_heatmap import save_rollout_video
+
+    _stub_save_video(monkeypatch)
+    _, _, _, result = _collect(n_batch=1)
+    render_error_heatmap(result, tmp_path / "heat.png")
+    out = save_rollout_video(_FakePipe(), result["final_latents"], tmp_path / "r.mp4",
+                             device="cpu")
+    assert (tmp_path / "heat.png").is_file() and out[0].is_file()
