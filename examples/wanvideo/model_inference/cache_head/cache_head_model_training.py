@@ -54,8 +54,8 @@ from cache_head_ddp import DistributedContext, initialize_distributed
 from fake_score_wan import FakeScoreWan
 
 
-# Arms that train a head.  ``carry_previous`` is the zero-init baseline and is
-# never trained.  The loop an arm runs is derived from the arm itself rather
+# Arms that train a head.  ``carry_previous`` is the explicit zero-residual
+# baseline and is never trained.  The loop an arm runs is derived from the arm itself rather
 # than a second, orthogonal switch.
 DMD_ARMS = ("dmd", "dmd_plus_reg")
 TRAINING_ARMS = ("residual_regression", "supervised") + DMD_ARMS
@@ -1095,6 +1095,7 @@ def build_heatmap_hook(
 
     from cache_head_error_heatmap import (
         collect_step_errors,
+        print_prompts,
         render_error_heatmap,
         save_error_arrays,
     )
@@ -1107,6 +1108,7 @@ def build_heatmap_hook(
     def hook(epoch: int, save_dir: Path) -> None:
         if epoch % args.heatmap_every != 0:
             return
+        print_prompts(captions, prefix=f"[epoch {epoch} heatmap]")
         generator = torch.Generator(device="cpu").manual_seed(args.seed)
         latents = torch.randn(
             len(captions), *trainer.latent_shape[1:], generator=generator

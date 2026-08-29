@@ -15,11 +15,13 @@ residual on top of the nearest preceding guided noise-token prediction:
 
 Architecture (lightweight token-grid residual network):
 
-    RMSNorm -> timestep AdaLN -> channel MLP -> depthwise 3D token-grid mixer
-    -> timestep AdaLN -> zero-initialized output projection.
+RMSNorm -> timestep AdaLN -> channel MLP -> depthwise 3D token-grid mixer
+    -> timestep AdaLN -> small random-initialized output projection.
 
-The output projection is zero-initialized so a freshly constructed head emits
-exactly zero residual and reproduces ``carry_previous`` bit-for-bit.
+Fresh training heads use a small random output projection, so every layer gets
+a learning signal from the first optimizer step.  The explicit
+``zero_init_out_proj`` construction option remains available for the
+``carry_previous`` baseline.
 
 The checkpoint stores the head weights plus the schedule, head architecture,
 and CFG scale so inference is self-describing.
@@ -198,11 +200,12 @@ class CacheHead(nn.Module):
     ``[B, S, C]`` which the sampler adds to the nearest preceding guided
     noise-token prediction.
 
-    The zero-initialized output projection makes a fresh head emit exactly
-    zero, i.e. reproduce ``carry_previous``.
+    Fresh training heads use a small random output projection.  Set
+    ``zero_init_out_proj=True`` only to construct the exact
+    ``carry_previous`` baseline.
     """
 
-    def __init__(self, config: CacheHeadConfig):
+    def __init__(self, config: CacheHeadConfig, *, zero_init_out_proj: bool = False):
         super().__init__()
         self.config = config
         dim = config.token_channels
@@ -226,8 +229,13 @@ class CacheHead(nn.Module):
         self.adaln2 = TimestepAdaLN(dim, freq_dim=config.freq_dim, dropout=config.adaln_dropout)
         #  this is due to the observation that different timestep have different magnitude of residual
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        # Zero init -> residual == 0 -> carry_previous.
-        nn.init.zeros_(self.out_proj.weight)
+        # A small random residual gives all layers gradient signal immediately,
+        # unlike an exact-zero projection.  The explicit carry baseline keeps
+        # its old bit-for-bit behaviour through ``zero_init_out_proj``.
+        if zero_init_out_proj:
+            nn.init.zeros_(self.out_proj.weight)
+        else:
+            nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02)
 
     def forward(
         self,

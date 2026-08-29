@@ -188,9 +188,8 @@ def _save_trajectory(npz_path, states, scheduler, method, prompt_id, seed):
 def check_checkpoint(checkpoint: str | None) -> None:
     """Fail loudly, and early, on a ``--checkpoint`` that does not exist.
 
-    Silently falling back to a zero-init head makes the run identical to
-    ``carry_previous`` -- and identical across every checkpoint you point at,
-    which reads as "the head does nothing" rather than "the path is wrong".
+    Silently falling back to an untrained head makes the run misleading -- it
+    can look like a valid hybrid sample while ignoring the intended checkpoint.
     Checked before Wan is loaded so a typo costs a second, not a model load.
     """
     if not checkpoint:
@@ -205,7 +204,7 @@ def check_checkpoint(checkpoint: str | None) -> None:
         f"--checkpoint {ckpt} does not exist.{hint}\n"
         f"  Training writes cache_head_step-<N>.ckpt, cache_head_final.ckpt, and "
         f"(supervised arm) cache_head_best.ckpt.\n"
-        f"  Omit --checkpoint, or pass --mode carry, to run the zero-init baseline."
+        f"  Pass --mode carry for the exact carry_previous baseline."
     )
 
 
@@ -244,10 +243,13 @@ def run_pipeline(args) -> None:
     else:
         config = CacheHeadConfig(model_id=args.model_id, cfg_scale=args.cfg)
         head = CacheHead(config).to(device=device, dtype=dtype).eval()
-        print("No checkpoint: using zero-initialized head (carry_previous)")
+        print("No checkpoint: using a randomly initialized head (untrained)")
 
     if args.mode == "carry":
-        head = CacheHead(CacheHeadConfig(model_id=args.model_id, cfg_scale=args.cfg)).to(
+        head = CacheHead(
+            CacheHeadConfig(model_id=args.model_id, cfg_scale=args.cfg),
+            zero_init_out_proj=True,
+        ).to(
             device=device, dtype=dtype
         ).eval()
         print("Mode=carry: forcing zero-init head (carry_previous)")

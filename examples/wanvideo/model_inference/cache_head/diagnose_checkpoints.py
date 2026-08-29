@@ -2,7 +2,7 @@
 
 Answers, in order of how often it is the cause:
 
-  1. The head never left zero-init, so both checkpoints are literally
+  1. The head's residual is effectively zero, so both checkpoints are
      ``carry_previous`` and every hybrid run is byte-identical.  On the ``dmd``
      arm with ``--warmup-steps 0`` this is the expected early behaviour: the
      LoRA fake-score is zero-delta at init, so ``fake_x0 == teacher_x0``, the

@@ -165,7 +165,7 @@ def test_zero_init_head_equals_carry_previous():
             x = scheduler.step(noise_pred, t, x)
         return x
 
-    zero_head = CacheHead(CacheHeadConfig())
+    zero_head = CacheHead(CacheHeadConfig(), zero_init_out_proj=True)
     sampler = HybridSampler(dit, scheduler, zero_head, schedule, cfg_scale=5.0, patch_size=PATCH_SIZE, grid=GRID)
     final_hybrid, _, _ = sampler.sample(latents, ctx_posi, ctx_nega)
     final_carry = reference_carry(latents)
@@ -304,7 +304,7 @@ def test_sample_reports_whether_the_head_changed_anything():
     report its own effect rather than leave it to be inferred from the video.
     """
     schedule = CacheHeadSchedule(15, (1, 2, 6, 10, 14))
-    zero = CacheHead(CacheHeadConfig()).eval()          # exact carry_previous
+    zero = CacheHead(CacheHeadConfig(), zero_init_out_proj=True).eval()
     sampler = HybridSampler(FakeDit(), FakeScheduler(15), zero, schedule,
                             5.0, (1, 2, 2), (2, 3, 4))
     latents = torch.randn(1, 16, 2, 6, 8)
