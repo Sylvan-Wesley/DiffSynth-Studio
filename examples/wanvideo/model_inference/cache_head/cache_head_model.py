@@ -97,6 +97,23 @@ class CacheHeadSchedule:
         return not self.is_full_step(progress_id)
 
 
+def parse_full_step_indices(spec: str) -> tuple[int, ...]:
+    """Parse a comma-separated 1-indexed anchor/dense-step list, e.g. "1,2,6,10,14".
+
+    Only converts and shapes the input; ``CacheHeadSchedule.validate()`` (run
+    from ``__post_init__``) is the single source of truth for range,
+    uniqueness, and ordering, so this stays a dumb splitter shared by both the
+    training and inference CLIs.
+    """
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"must be a non-empty comma-separated list of ints, got {spec!r}")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError as exc:
+        raise ValueError(f"must be a comma-separated list of ints, got {spec!r}") from exc
+
+
 @dataclass(frozen=True)
 class CacheHeadConfig:
     """Everything needed to rebuild a deployed head from a checkpoint."""

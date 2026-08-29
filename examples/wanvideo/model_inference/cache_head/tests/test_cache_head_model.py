@@ -17,6 +17,7 @@ from cache_head_model import (
     CacheHeadConfig,
     CacheHeadSchedule,
     load_cache_head,
+    parse_full_step_indices,
     save_cache_head,
     token_grid,
     unpatchify_tokens,
@@ -50,6 +51,37 @@ def test_schedule_rejects_bad_indices(bad):
 def test_schedule_rejects_empty():
     with pytest.raises(ValueError):
         CacheHeadSchedule(15, ())
+
+
+# ═══════════════════════════════════════════════════════════════
+# --full-steps CLI parsing (shared by the training and inference CLIs)
+# ═══════════════════════════════════════════════════════════════
+
+def test_parse_full_step_indices_basic():
+    assert parse_full_step_indices("1,2,6,10,14") == (1, 2, 6, 10, 14)
+
+
+def test_parse_full_step_indices_strips_whitespace():
+    assert parse_full_step_indices(" 1, 2 ,6 ") == (1, 2, 6)
+
+
+def test_parse_full_step_indices_tolerates_stray_commas():
+    # Trailing/doubled commas are a harmless typo, not a parse error.
+    assert parse_full_step_indices("1,2,6,") == (1, 2, 6)
+    assert parse_full_step_indices("1,,3") == (1, 3)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "1,a,3"])
+def test_parse_full_step_indices_rejects_garbage(bad):
+    with pytest.raises(ValueError):
+        parse_full_step_indices(bad)
+
+
+def test_parse_full_step_indices_feeds_schedule_validation():
+    # A syntactically fine but semantically bad spec (duplicate, unsorted) is
+    # still rejected -- by CacheHeadSchedule, not the parser itself.
+    with pytest.raises(ValueError):
+        CacheHeadSchedule(15, parse_full_step_indices("2,1"))
 
 
 # ═══════════════════════════════════════════════════════════════

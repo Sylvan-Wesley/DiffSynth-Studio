@@ -47,6 +47,7 @@ from cache_head_model import (
     CacheHead,
     CacheHeadConfig,
     CacheHeadSchedule,
+    parse_full_step_indices,
     save_cache_head,
     unpatchify_tokens,
 )
@@ -885,6 +886,11 @@ def main() -> None:
     parser.add_argument("--reg-loss", choices=["huber", "mse"], default="huber")
     parser.add_argument("--cfg", type=float, default=5.0)
     parser.add_argument("--num-steps", type=int, default=15)
+    parser.add_argument(
+        "--full-steps", type=parse_full_step_indices, default=None,
+        help="1-indexed anchor (full-Wan / 'dense') step positions, comma-separated, "
+             "e.g. '1,2,6,10,14' (default: the schedule's built-in anchors)",
+    )
     parser.add_argument("--num-frames", type=int, default=81)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
@@ -1018,7 +1024,10 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         "杂乱的背景，三条腿，背景人很多，倒着走"
     )
 
-    schedule = CacheHeadSchedule(num_inference_steps=args.num_steps, full_step_indices=(1, 2, 6, 10, 14))
+    schedule = CacheHeadSchedule(
+        num_inference_steps=args.num_steps,
+        full_step_indices=args.full_steps or (1, 2, 6, 10, 14),
+    )
     config = CacheHeadConfig(model_id=args.model_id, schedule=schedule, cfg_scale=args.cfg)
     head = CacheHead(config).to(device=device, dtype=dtype)
     # FakeScoreWan deep-copies the whole DiT; only the DMD arms need it, and

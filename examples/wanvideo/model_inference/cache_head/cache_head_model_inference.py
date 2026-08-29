@@ -39,6 +39,7 @@ from cache_head_model import (
     CacheHeadConfig,
     CacheHeadSchedule,
     load_cache_head,
+    parse_full_step_indices,
     unpatchify_tokens,
 )
 
@@ -151,9 +152,22 @@ class HybridSampler:
 # Wan setup + CLI (requires the Wan pipeline installed)
 # ═══════════════════════════════════════════════════════════════
 
-def _build_schedule(mode: str, num_steps: int, config: CacheHeadConfig | None) -> CacheHeadSchedule:
+def _build_schedule(
+    mode: str,
+    num_steps: int,
+    config: CacheHeadConfig | None,
+    full_step_indices: tuple[int, ...] | None = None,
+) -> CacheHeadSchedule:
     if mode == "full":
+        if full_step_indices is not None:
+            print("--full-steps ignored: --mode full always runs every step through Wan")
         return CacheHeadSchedule(num_inference_steps=num_steps, full_step_indices=tuple(range(1, num_steps + 1)))
+    if full_step_indices is not None:
+        if config is not None and config.schedule.full_step_indices != full_step_indices:
+            print(f"[warning] --full-steps {full_step_indices} overrides the checkpoint's trained "
+                  f"schedule {config.schedule.full_step_indices}; the head was not trained for "
+                  f"this anchor placement")
+        return CacheHeadSchedule(num_inference_steps=num_steps, full_step_indices=full_step_indices)
     if config is not None:
         return config.schedule
     return CacheHeadSchedule(num_inference_steps=num_steps)
@@ -287,7 +301,7 @@ def run_pipeline(args) -> None:
         ).eval()
         print("Mode=carry: forcing zero-init head (carry_previous)")
 
-    schedule = _build_schedule(args.mode, args.num_steps, config)
+    schedule = _build_schedule(args.mode, args.num_steps, config, full_step_indices=args.full_steps)
     print(f"Schedule: {schedule.num_inference_steps} steps, "
           f"full={schedule.full_step_indices}, head={schedule.head_step_indices}")
     cfg_scale = config.cfg_scale if args.mode == "hybrid" and config is not None else args.cfg
@@ -395,6 +409,12 @@ def main() -> None:
         "杂乱的背景，三条腿，背景人很多，倒着走"
     ))
     parser.add_argument("--num-steps", type=int, default=15)
+    parser.add_argument(
+        "--full-steps", type=parse_full_step_indices, default=None,
+        help="1-indexed anchor (full-Wan / 'dense') step positions, comma-separated, "
+             "e.g. '1,2,6,10,14'. Overrides the checkpoint's trained schedule "
+             "(--mode full ignores this: every step already runs through Wan)",
+    )
     parser.add_argument("--cfg", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=81)

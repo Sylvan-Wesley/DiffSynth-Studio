@@ -10,7 +10,7 @@ from cache_head_model import (
     CacheHeadSchedule,
     unpatchify_tokens,
 )
-from cache_head_model_inference import HybridSampler, full_step, head_step
+from cache_head_model_inference import HybridSampler, _build_schedule, full_step, head_step
 
 
 PATCH_SIZE = (1, 2, 2)
@@ -324,3 +324,37 @@ def test_sample_reports_whether_the_head_changed_anything():
     _, _, stats = sampler.sample(latents, ctx, ctx)
     assert all(c > 0.5 for c in stats["head_tokens_changed"])
     assert all(r > 0.0 for r in stats["head_residual_rel"])
+
+
+# ═══════════════════════════════════════════════════════════════
+# --full-steps dense-step-allocation override
+# ═══════════════════════════════════════════════════════════════
+
+def test_build_schedule_defaults_to_checkpoint_when_no_override():
+    config = CacheHeadConfig(schedule=CacheHeadSchedule(15, (1, 2, 6, 10, 14)))
+    schedule = _build_schedule("hybrid", 15, config)
+    assert schedule.full_step_indices == (1, 2, 6, 10, 14)
+
+
+def test_build_schedule_override_replaces_checkpoint_schedule():
+    config = CacheHeadConfig(schedule=CacheHeadSchedule(15, (1, 2, 6, 10, 14)))
+    schedule = _build_schedule("hybrid", 15, config, full_step_indices=(1, 8, 15))
+    assert schedule.full_step_indices == (1, 8, 15)
+    assert schedule.num_inference_steps == 15
+
+
+def test_build_schedule_override_without_checkpoint():
+    schedule = _build_schedule("hybrid", 15, None, full_step_indices=(1, 8, 15))
+    assert schedule.full_step_indices == (1, 8, 15)
+
+
+def test_build_schedule_full_mode_ignores_override():
+    config = CacheHeadConfig(schedule=CacheHeadSchedule(15, (1, 2, 6, 10, 14)))
+    schedule = _build_schedule("full", 15, config, full_step_indices=(1, 8, 15))
+    assert schedule.full_step_indices == tuple(range(1, 16))
+
+
+def test_build_schedule_override_warns_on_checkpoint_mismatch(capsys):
+    config = CacheHeadConfig(schedule=CacheHeadSchedule(15, (1, 2, 6, 10, 14)))
+    _build_schedule("hybrid", 15, config, full_step_indices=(1, 8, 15))
+    assert "overrides the checkpoint's trained schedule" in capsys.readouterr().out
