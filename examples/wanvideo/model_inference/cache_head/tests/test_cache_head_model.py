@@ -56,8 +56,9 @@ def test_schedule_rejects_empty():
 # CacheHead network
 # ═══════════════════════════════════════════════════════════════
 
-def test_cachehead_zero_init_is_carry_previous():
-    """A freshly constructed head emits an exactly-zero residual."""
+def test_cachehead_random_init_emits_a_nonzero_residual():
+    """A fresh training head has a nonzero random residual."""
+    torch.manual_seed(0)
     head = CacheHead(CacheHeadConfig())
     head.eval()
     grid = (3, 2, 3)
@@ -65,7 +66,15 @@ def test_cachehead_zero_init_is_carry_previous():
     t = torch.tensor([500.0, 100.0])
     out = head(tokens, t, grid)
     assert out.shape == tokens.shape
-    assert torch.equal(out, torch.zeros_like(out)), "zero-init output must reproduce carry_previous exactly"
+    assert not torch.equal(out, torch.zeros_like(out))
+
+
+def test_cachehead_explicit_zero_init_is_carry_previous():
+    """Only the explicit baseline head emits an exactly-zero residual."""
+    head = CacheHead(CacheHeadConfig(), zero_init_out_proj=True).eval()
+    tokens = torch.randn(2, 18, 64)
+    out = head(tokens, torch.tensor([500.0, 100.0]), (3, 2, 3))
+    assert torch.equal(out, torch.zeros_like(out))
 
 
 def test_cachehead_forward_shapes_and_grid_mismatch():
@@ -75,11 +84,8 @@ def test_cachehead_forward_shapes_and_grid_mismatch():
         head(torch.randn(1, 60, 64), torch.tensor([500.0]), (3, 4, 4))  # 3*4*4 = 48 != 60
 
 
-def test_cachehead_learns_away_from_zero():
-    """Trained against a velocity target (prev + residual), the head moves the
-    residual away from the zero-init carry_previous.  A loss directly on the
-    residual would have zero gradient through the zero-init out_proj, so the
-    test uses the real training target: ``v_hat = prev_guided + residual``."""
+def test_cachehead_backpropagates_through_every_parameter():
+    """A velocity target gives every randomly initialized head layer a gradient."""
     head = CacheHead(CacheHeadConfig())
     head.train()
     grid = (3, 2, 3)
@@ -94,7 +100,9 @@ def test_cachehead_learns_away_from_zero():
     n_grads = sum(p.grad is not None for p in head.parameters())
     assert n_grads == n_params
 
-    # A single optimizer step moves the residual away from zero.
+    # A single optimizer step changes the residual.
+    with torch.no_grad():
+        residual0 = head(tokens, t, grid).clone()
     opt = torch.optim.AdamW(head.parameters(), lr=1e-1)
     opt.zero_grad()
     v_hat = prev_guided + head(tokens, t, grid)
@@ -103,7 +111,7 @@ def test_cachehead_learns_away_from_zero():
     head.eval()
     with torch.no_grad():
         residual1 = head(tokens, t, grid)
-    assert not torch.equal(residual1, torch.zeros_like(residual1))
+    assert not torch.equal(residual1, residual0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -222,10 +230,6 @@ def test_head_forward_runs_in_every_precision(dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_head_backward_runs_in_low_precision(dtype):
     head = CacheHead(CacheHeadConfig()).to(dtype=dtype)
-    # Zero-init out_proj means a fresh head has no gradient signal to speak of;
-    # perturb it so the backward actually exercises every parameter.
-    with torch.no_grad():
-        head.out_proj.weight.add_(0.05 * torch.randn_like(head.out_proj.weight))
     tokens = torch.randn(1, 24, 64, dtype=dtype)
     out = head(tokens, torch.tensor([500.0], dtype=dtype), (2, 3, 4))
     out.float().pow(2).mean().backward()

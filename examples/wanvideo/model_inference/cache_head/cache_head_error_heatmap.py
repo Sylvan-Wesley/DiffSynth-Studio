@@ -145,6 +145,13 @@ def step_summary(result: dict, relative: bool = False) -> dict:
 _SEQUENTIAL_CMAP = "magma"
 
 
+def print_prompts(prompts: list[str], *, prefix: str = "[heatmap]") -> None:
+    """Print the exact captions represented by a heat-map batch."""
+    print(f"{prefix} prompts ({len(prompts)}):")
+    for index, prompt in enumerate(prompts, start=1):
+        print(f"  [{index}] {prompt}")
+
+
 def render_error_heatmap(
     result: dict,
     out_path: str | Path,
@@ -372,6 +379,9 @@ def main() -> None:
 
     dataset = PromptDataset(args.captions, split=args.split)
     captions = [caption for _, caption in dataset.items[:args.num_prompts]]
+    if not captions:
+        raise ValueError(f"no captions found in split {args.split!r}")
+    print_prompts(captions)
     ctx = encode(captions)
     neg_ctx = encode(
         "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，"

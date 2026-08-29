@@ -235,7 +235,10 @@ def _method_sampler(dit, scheduler, method: str, head: CacheHead, config: CacheH
         schedule = CacheHeadSchedule(num_inference_steps=n, full_step_indices=tuple(range(1, n + 1)))
         return HybridSampler(dit, scheduler, head, schedule, cfg_scale, patch_size, grid)
     if method == METHOD_CARRY:
-        zero = CacheHead(CacheHeadConfig(model_id=config.model_id, cfg_scale=cfg_scale))
+        zero = CacheHead(
+            CacheHeadConfig(model_id=config.model_id, cfg_scale=cfg_scale),
+            zero_init_out_proj=True,
+        )
         return HybridSampler(dit, scheduler, zero, config.schedule, cfg_scale, patch_size, grid)
     return HybridSampler(dit, scheduler, head, config.schedule, cfg_scale, patch_size, grid)
 

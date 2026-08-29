@@ -60,7 +60,7 @@ def test_zero_init_head_reproduces_carry_previous_error():
     torch.manual_seed(0)
     dit = FakeDit()
     scheduler = FakeScheduler(15)
-    head = CacheHead(CacheHeadConfig())          # zero-init out_proj
+    head = CacheHead(CacheHeadConfig(), zero_init_out_proj=True)
     latents = torch.randn(1, *LATENT_SHAPE[1:])
     ctx = torch.randn(1, 4, 8)
     neg_ctx = torch.randn(1, 4, 8)
