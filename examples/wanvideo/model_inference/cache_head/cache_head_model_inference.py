@@ -28,6 +28,7 @@ The pure sampling loop lives in ``HybridSampler`` / ``full_step`` /
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -208,6 +209,37 @@ def check_checkpoint(checkpoint: str | None) -> None:
     )
 
 
+def apply_no_network(args) -> None:
+    """Resolve every model from local disk and make no outbound requests.
+
+    Mirrors ``cache_head_model_training.apply_no_network`` (kept as a separate
+    copy rather than a shared import: this module imports ``full_step`` /
+    ``head_step`` and the training module imports back from here, so an
+    import the other way would be circular).
+
+    ``ModelConfig.download_if_necessary`` only calls the hub when
+    ``require_downloading()`` is true; with downloads skipped it falls through
+    to globbing ``<model-base-path>/<model_id>/<origin_file_pattern>``.  The
+    Hugging Face variables cover the tokenizer, which loads through
+    ``AutoTokenizer.from_pretrained`` and would otherwise still try to reach
+    the hub for a revision check.
+
+    Must run before the deferred ``diffsynth`` / ``transformers`` imports in
+    ``run_pipeline``, which is why it is called from ``main``.
+    """
+    if not getattr(args, "no_network", False):
+        return
+    os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "true"
+    if args.model_base_path:
+        os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = args.model_base_path
+    # setdefault: never override an offline setup the operator already made.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    base = os.environ.get("DIFFSYNTH_MODEL_BASE_PATH", "./models")
+    print(f"[no-network] downloads disabled; resolving models under {base}/<model_id>/")
+
+
 def run_pipeline(args) -> None:
     check_checkpoint(getattr(args, "checkpoint", None))
 
@@ -219,15 +251,16 @@ def run_pipeline(args) -> None:
     dtype = torch.bfloat16 if getattr(args, "dtype", "bf16") == "bf16" else torch.float16
     print(f"Device: {device}, dtype: {dtype}")
 
+    model_kwargs = {"skip_download": True} if getattr(args, "no_network", False) else {}
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=dtype,
         device=device,
         model_configs=[
-            ModelConfig(model_id=args.model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors"),
-            ModelConfig(model_id=args.model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
-            ModelConfig(model_id=args.model_id, origin_file_pattern="Wan2.1_VAE.pth"),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors", **model_kwargs),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", **model_kwargs),
+            ModelConfig(model_id=args.model_id, origin_file_pattern="Wan2.1_VAE.pth", **model_kwargs),
         ],
-        tokenizer_config=ModelConfig(model_id=args.model_id, origin_file_pattern="google/umt5-xxl/"),
+        tokenizer_config=ModelConfig(model_id=args.model_id, origin_file_pattern="google/umt5-xxl/", **model_kwargs),
     )
     dit = pipe.dit
     scheduler = pipe.scheduler
@@ -347,6 +380,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Hybrid Wan + CacheHead inference")
     parser.add_argument("--checkpoint", default=None, help="CacheHead checkpoint (schedule/config stored inside)")
     parser.add_argument("--model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
+    parser.add_argument("--no-network", action="store_true",
+                        help="offline mode: never contact modelscope/HuggingFace. "
+                             "Model files must already sit under "
+                             "--model-base-path/<model-id>/ (see --model-base-path)")
+    parser.add_argument("--model-base-path", default=None,
+                        help="local model root for --no-network; weights are read from "
+                             "<path>/<model-id>/... (default: DIFFSYNTH_MODEL_BASE_PATH, "
+                             "else ./models)")
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--negative-prompt", default=(
         "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，"
@@ -366,6 +407,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.prompt is None:
         raise SystemExit("--prompt is required")
+    apply_no_network(args)
     run_pipeline(args)
 
 
