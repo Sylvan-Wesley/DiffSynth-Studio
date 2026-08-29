@@ -281,7 +281,22 @@ def test_train_few_steps_finite_and_checkpoint(tmp_path):
     logs = trainer.train(save_dir=str(tmp_path), checkpoint_every=2, log_interval=1000)
     assert len(logs) == trainer.warmup_steps + trainer.updates
     assert all(rec["finite"] for rec in logs)
+    # The student's pre-clip gradient norm rides along on every step record; the
+    # fake score never runs on this arm, so its norm stays NaN.
+    assert all(torch.isfinite(torch.tensor(rec["grad_norm"])) for rec in logs)
+    assert all(torch.isnan(torch.tensor(rec["fake_grad_norm"])) for rec in logs)
     assert (tmp_path / "cache_head_final.ckpt").is_file()
+
+
+def test_train_mirrors_progress_lines_into_run_log(tmp_path):
+    trainer = _make_trainer("residual_regression")
+    log_path = tmp_path / "logs" / "residual_regression-20260828-120000+0000.txt"
+    log_path.parent.mkdir()
+    trainer.train(save_dir=None, checkpoint_every=0, log_interval=1, log_path=log_path)
+
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == trainer.warmup_steps + trainer.updates
+    assert all("grad_norm=" in line for line in lines)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -431,6 +446,7 @@ def test_train_supervised_runs_epochs_and_validates(tmp_path):
     train_records = [r for r in logs if r["phase"] == "supervised"]
     val_records = [r for r in logs if r["phase"] == "val"]
     assert train_records and all(r["finite"] for r in train_records)
+    assert all(torch.isfinite(torch.tensor(r["grad_norm"])) for r in train_records)
     # 3 prompts, micro_batch 1 x accum 2 -> 1 optimizer step per epoch, 2 epochs.
     assert len(train_records) == 2
     assert len(val_records) == 2

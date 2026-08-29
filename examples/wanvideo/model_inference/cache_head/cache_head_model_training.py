@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import random
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -305,6 +306,8 @@ class CacheHeadTrainer:
             self.fake_score.eval()
 
         self.logs: list[dict] = []
+        # Plain-text mirror of the progress lines; ``train`` fills it in.
+        self.log_path: Path | None = None
 
     # ---- sampling --------------------------------------------------------
 
@@ -564,6 +567,17 @@ class CacheHeadTrainer:
                   f"(effective batch {micro * accum} per rank, peak {peak / 1024 ** 3:.1f} GiB)")
         return micro, accum
 
+    def _emit(self, line: str) -> None:
+        """Print a progress line and append it to the dated run log.
+
+        The file is reopened per line so a crashed or killed run still leaves
+        every line it had already reported on disk.
+        """
+        print(line)
+        if self.log_path is not None:
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
     def train(
         self,
         checkpoint_every: int = 1000,
@@ -572,6 +586,7 @@ class CacheHeadTrainer:
         wandb_run: Any | None = None,
         training_type: str | None = None,
         heatmap_hook: Callable[[int, Path], Any] | None = None,
+        log_path: str | Path | None = None,
     ):
         """Run the loop this arm calls for.
 
@@ -594,6 +609,7 @@ class CacheHeadTrainer:
             self.distributed.barrier()
 
         self.logs = []
+        self.log_path = Path(log_path) if log_path else None
         if training_type == "supervised":
             self._train_supervised(
                 accum=accum, checkpoint_every=checkpoint_every, save_dir=save_dir,
@@ -684,7 +700,9 @@ class CacheHeadTrainer:
                         micro_losses.append(float(out["loss"].detach().item()))
                         for rec in out["per_step"]:
                             per_step_acc[rec["step"]] = per_step_acc.get(rec["step"], 0.0) + rec["loss"]
-                torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
+                )
                 self.head_opt.step()
 
                 loss_value = sum(micro_losses) / len(micro_losses)
@@ -697,6 +715,7 @@ class CacheHeadTrainer:
                     "epoch": epoch,
                     "phase": self.arm,
                     "loss": loss_value,
+                    "grad_norm": grad_norm,
                     "fake_score_loss": float("nan"),
                     "per_step": {k: v / accum for k, v in sorted(per_step_acc.items())},
                     "finite": finite,
@@ -704,11 +723,14 @@ class CacheHeadTrainer:
                 if self.distributed.is_main_process:
                     self.logs.append(record)
                     if global_step % log_interval == 0:
-                        print(f"[epoch {epoch} {step_in_epoch}/{steps_per_epoch}] "
-                              f"{record['phase']} loss={record['loss']:.4e}")
+                        self._emit(f"[epoch {epoch} {step_in_epoch}/{steps_per_epoch}] "
+                                   f"{record['phase']} loss={record['loss']:.4e} "
+                                   f"grad_norm={record['grad_norm']:.4e}")
                         if wandb_run is not None:
                             wandb_run.log(
-                                {"loss": record["loss"], "epoch": epoch}, step=global_step
+                                {"loss": record["loss"], "grad_norm": record["grad_norm"],
+                                 "epoch": epoch},
+                                step=global_step,
                             )
 
                 if (save_dir and checkpoint_every > 0 and self.distributed.is_main_process
@@ -721,7 +743,7 @@ class CacheHeadTrainer:
             if metrics:
                 self.logs.append({"step": global_step, "epoch": epoch, "phase": "val", **metrics})
                 if self.distributed.is_main_process:
-                    print(f"[epoch {epoch}] val_loss={metrics['val_loss']:.4e}")
+                    self._emit(f"[epoch {epoch}] val_loss={metrics['val_loss']:.4e}")
                     if wandb_run is not None:
                         wandb_run.log(
                             {"val_loss": metrics["val_loss"], "epoch": epoch}, step=global_step
@@ -750,22 +772,28 @@ class CacheHeadTrainer:
                     sample = self.sample_one()
                     out = self.dmd(sample) if use_dmd else self.regression(sample)
                     (out["loss"] / accum).backward()
-            torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
+            )
             self.head_opt.step()
 
             # --- fake-score updates (5 per CacheHead update, dmd arms only) ---
             if use_dmd:
                 self.fake_score.train()
+                fs_grad_norms = []
                 for _ in range(5):
                     sample = self.sample_one()
                     fs_loss = self.fake_score_update(sample)
                     self.fake_opt.zero_grad(set_to_none=True)
                     fs_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.fake_score_module.lora_parameters(), self.grad_clip)
+                    fs_grad_norms.append(float(torch.nn.utils.clip_grad_norm_(
+                        self.fake_score_module.lora_parameters(), self.grad_clip)))
                     self.fake_opt.step()
                 self.fake_score.eval()
+                fake_grad_norm = sum(fs_grad_norms) / len(fs_grad_norms)
             else:
                 fs_loss = torch.tensor(float("nan"))
+                fake_grad_norm = float("nan")
 
             finite = self.distributed.all_true(bool(torch.isfinite(out["loss"]).all().item()))
             if not finite:
@@ -775,14 +803,18 @@ class CacheHeadTrainer:
                 "step": global_step,
                 "phase": "warmup" if not use_dmd else self.arm,
                 "loss": float(out["loss"].detach().item()),
+                "grad_norm": grad_norm,
                 "fake_score_loss": float(fs_loss.detach().item()) if fs_loss.ndim == 0 else float("nan"),
+                "fake_grad_norm": fake_grad_norm,
                 "finite": finite,
             }
             if self.distributed.is_main_process:
                 self.logs.append(record)
                 if global_step % log_interval == 0:
-                    print(f"[{global_step}/{total}] {record['phase']} loss={record['loss']:.4e} "
-                          f"fake={record['fake_score_loss']:.4e}")
+                    self._emit(f"[{global_step}/{total}] {record['phase']} "
+                               f"loss={record['loss']:.4e} "
+                               f"grad_norm={record['grad_norm']:.4e} "
+                               f"fake={record['fake_score_loss']:.4e}")
                     if wandb_run is not None:
                         wandb_run.log(record, step=global_step)
 
@@ -870,6 +902,11 @@ def main() -> None:
         help="print and, when enabled, send W&B metrics every N optimizer steps",
     )
     parser.add_argument(
+        "--log-dir", default="training_logs",
+        help="directory for the plain-text run log; rank 0 writes "
+             "<log-dir>/<arm>-<start time>.txt there (pass '' to disable)",
+    )
+    parser.add_argument(
         "--wandb-project",
         help="enable Weights & Biases logging to this project (rank 0 only)",
     )
@@ -889,9 +926,9 @@ def main() -> None:
     if args.no_network and args.wandb_project and args.wandb_mode != "offline":
         print("[no-network] disabling W&B (pass --wandb-mode offline to keep local logging)")
         args.wandb_project = None
-    args.wandb_start_time = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S%z")
+    args.run_start_time = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S%z")
     if args.wandb_run_name:
-        args.wandb_run_name = f"{args.wandb_run_name}-{args.wandb_start_time}"
+        args.wandb_run_name = f"{args.wandb_run_name}-{args.run_start_time}"
     if args.checkpoint_every < 0:
         parser.error("--checkpoint-every must be non-negative")
     if args.micro_batch < 1:
@@ -1049,10 +1086,31 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
             log_interval=args.log_interval,
             wandb_run=wandb_run,
             heatmap_hook=build_heatmap_hook(args, trainer, wandb_run),
+            log_path=open_run_log(args, distributed),
         )
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+
+
+def open_run_log(args: argparse.Namespace, distributed: DistributedContext) -> Path | None:
+    """Create ``--log-dir`` and start a run log stamped with the launch time.
+
+    Only rank 0 keeps a file: the other ranks never print progress lines, so
+    they would only create empty logs.  The header records the exact command so
+    a log read months later still says which run produced it.
+    """
+    if not args.log_dir or not distributed.is_main_process:
+        return None
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"{args.arm}-{args.run_start_time}.txt"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"# CacheHead training -- arm={args.arm} started={args.run_start_time}\n")
+        fh.write(f"# world_size={distributed.world_size} device={distributed.device}\n")
+        fh.write(f"# command: {' '.join(sys.argv)}\n")
+    print(f"[log] run log: {path}")
+    return path
 
 
 def apply_no_network(args: argparse.Namespace) -> None:
