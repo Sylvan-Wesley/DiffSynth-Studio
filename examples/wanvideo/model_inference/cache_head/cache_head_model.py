@@ -55,7 +55,7 @@ class CacheHeadSchedule:
     called with a 0-indexed progress id."""
 
     num_inference_steps: int = 15
-    full_step_indices: tuple[int, ...] = (1, 2, 6, 10, 14)
+    full_step_indices: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7)
 
     def __post_init__(self) -> None:
         # Normalize regardless of construction source (e.g. a list deserialized
