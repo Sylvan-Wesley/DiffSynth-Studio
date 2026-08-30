@@ -140,7 +140,7 @@ def test_prev_guided_propagation():
             assert torch.equal(seen_input, expected_prev), f"head step {progress_id} saw wrong tokens"
             assert seen_t == pytest.approx(float(scheduler.timesteps[progress_id].item()))
             # Expected prev for the next head step = v_tokens = input + residual.
-            residual = head(seen_input, torch.tensor([seen_t]), GRID)
+            residual = head(seen_input, torch.tensor([seen_t]), GRID) / 10.0
             expected_prev = seen_input + residual
     assert seen_idx == 10
 

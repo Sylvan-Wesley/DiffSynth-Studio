@@ -73,7 +73,7 @@ def head_step(head, timestep, prev_guided_tokens, grid, patch_size):
 
     Returns (noise_pred [B,C,F,H,W], v_tokens [B,S,64]).
     """
-    residual = head(prev_guided_tokens, timestep, grid)
+    residual = head(prev_guided_tokens, timestep, grid) / 10.0
     v_tokens = prev_guided_tokens + residual
     noise_pred = unpatchify_tokens(v_tokens, grid, patch_size)
     return noise_pred, v_tokens

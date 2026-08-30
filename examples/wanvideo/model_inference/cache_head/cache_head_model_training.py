@@ -380,13 +380,21 @@ class CacheHeadTrainer:
 
     def _head_step_grad(self, latents, prev_guided, step_j: int):
         """CacheHead update at step j WITH gradients.  Returns
-        (v_tokens, noise_pred, x0_G, t_j, sigma_j)."""
+        (v_tokens, noise_pred, x0_G, t_j, sigma_j, head_out).
+
+        ``head_out`` is the head's raw, undivided output: it is trained to
+        predict 100x the true (small) residual, so callers that build a loss
+        directly from it -- rather than from the /100-corrected ``v_tokens``
+        -- get an undiluted gradient into the head instead of one attenuated
+        by the same /100 that keeps ``v_tokens`` physically small.
+        """
         t_j = self._t(step_j)
         sigma_j = self._sigma(step_j)
-        v_tokens = prev_guided + self.head(prev_guided, t_j, self.grid)
+        head_out = self.head(prev_guided, t_j, self.grid)
+        v_tokens = prev_guided + head_out / 10.0
         noise_pred = unpatchify_tokens(v_tokens, self.grid, self.patch)
         x0_G = flow_to_x0(latents, noise_pred, sigma_j)
-        return v_tokens, noise_pred, x0_G, t_j, sigma_j
+        return v_tokens, noise_pred, x0_G, t_j, sigma_j, head_out
 
     def _match_sigma(self, batch: int) -> tuple[torch.Tensor, torch.Tensor]:
         # sigma stays float64 for exact flow math; the model-facing timestep is
@@ -401,24 +409,29 @@ class CacheHeadTrainer:
         """no_grad generator x0 prediction at the sampled head step."""
         latents, prev_guided = self._prefix_roll(sample["z"], sample["ctx"], sample["step_j"])
         with torch.no_grad():
-            _, _, x0_G, _, _ = self._head_step_grad(latents, prev_guided, sample["step_j"])
+            _, _, x0_G, _, _, _ = self._head_step_grad(latents, prev_guided, sample["step_j"])
         return x0_G
 
     # ---- loss arms -------------------------------------------------------
 
     def regression(self, sample: dict) -> dict:
         latents, prev_guided = self._prefix_roll(sample["z"], sample["ctx"], sample["step_j"])
-        v_tokens, _, x0_G, t_j, _ = self._head_step_grad(
+        v_tokens, _, x0_G, t_j, _, head_out = self._head_step_grad(
             latents, prev_guided, sample["step_j"]
         )
         with torch.no_grad():
             _, teacher_tokens = full_step(self.dit, latents, t_j, sample["ctx"], self.neg_ctx, self.cfg)
-        loss = regression_loss(v_tokens, teacher_tokens, self.reg_loss)
+        # Undiluted gradient: compare the head's raw output directly to the
+        # residual at its native (100x) scale, instead of through the
+        # /100-corrected v_tokens (see _head_step_grad).
+        scaled_v = prev_guided * 10.0 + head_out
+        scaled_teacher = teacher_tokens * 10.0
+        loss = regression_loss(scaled_v, scaled_teacher, self.reg_loss)
         return {"loss": loss, "x0_G": x0_G, "v_tokens": v_tokens}
 
     def dmd(self, sample: dict) -> dict:
         latents, prev_guided = self._prefix_roll(sample["z"], sample["ctx"], sample["step_j"])
-        v_tokens, _, x0_G, t_j, _ = self._head_step_grad(
+        v_tokens, _, x0_G, t_j, _, head_out = self._head_step_grad(
             latents, prev_guided, sample["step_j"]
         )
         # Perturb the generated x0 and query teacher + fake-score at the same state.
@@ -434,7 +447,9 @@ class CacheHeadTrainer:
         if self.arm == "dmd_plus_reg":
             with torch.no_grad():
                 _, teacher_tokens = full_step(self.dit, latents, t_j, sample["ctx"], self.neg_ctx, self.cfg)
-            reg = regression_loss(v_tokens, teacher_tokens, self.reg_loss)
+            scaled_v = prev_guided * 10.0 + head_out
+            scaled_teacher = teacher_tokens * 10.0
+            reg = regression_loss(scaled_v, scaled_teacher, self.reg_loss)
             loss = loss + self.reg_weight * reg
         return {"loss": loss, "x0_G": x0_G, "v_tokens": v_tokens}
 
@@ -473,7 +488,8 @@ class CacheHeadTrainer:
                         f"head step at progress {k} before any full step; "
                         f"invalid schedule {self.schedule}"
                     )
-                v_tokens = prev_guided + self.head(prev_guided, t, self.grid)
+                head_out = self.head(prev_guided, t, self.grid)
+                v_tokens = prev_guided + head_out / 10.0
                 with torch.no_grad():
                     _, teacher_tokens = full_step(
                         self.dit, latents, t, ctx, neg_ctx, self.cfg
@@ -487,11 +503,21 @@ class CacheHeadTrainer:
                         f"{expected_tokens + (WAN_NOISE_TOKEN_CHANNELS,)}, got "
                         f"head {tuple(v_tokens.shape)} vs teacher {tuple(teacher_tokens.shape)}"
                     )
+                # Loss is built from head_out directly (undivided) against the
+                # residual at its native 100x scale, not from the physically
+                # small v_tokens/teacher_tokens gap: the /100 above keeps
+                # v_tokens correct for unpatchify_tokens + the scheduler step
+                # below, but reusing it in the loss would dilute the gradient
+                # into head_out by another 100x on top of the residual
+                # already being small (the reason for this scaling).
                 # Accumulate in float32: under --precision bf16 the loss comes
                 # back as bf16 (~3 decimal digits), and summing ten of them then
                 # dividing throws away precision in both the logged value and
                 # the gradient.  Autograd carries the cast back through.
-                step_loss = regression_loss(v_tokens, teacher_tokens, self.reg_loss).float()
+                teacher_tokens_norm = teacher_tokens.abs().sum(dim=-1, keepdim=True).detach() + 1e-6
+                scaled_v_tokens = v_tokens / teacher_tokens_norm
+                scaled_teacher = teacher_tokens / teacher_tokens_norm
+                step_loss = regression_loss(scaled_v_tokens, scaled_teacher, self.reg_loss).float()
                 total = step_loss if total is None else total + step_loss
                 per_step.append({"step": k, "loss": float(step_loss.detach().item())})
                 noise_pred = unpatchify_tokens(v_tokens, self.grid, self.patch)
