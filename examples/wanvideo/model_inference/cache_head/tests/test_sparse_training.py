@@ -170,27 +170,40 @@ def test_supervised_step_requires_the_prompt_context(tmp_path):
         trainer.supervised_teacher_forced(guided, latents, None)
 
 
-def test_supervised_step_predicts_directly_rather_than_as_a_carry_residual(tmp_path):
-    """A zero-init fusion makes the *input* identical to the teacher's, but the
-    student still emits an unguided velocity, so it must not coincide with the
-    carry baseline."""
-    trainer, _ = make_trainer(tmp_path, pattern="dense")
+@pytest.mark.parametrize("pattern", ["dense", "spatiotemporal_window"])
+def test_a_fresh_student_starts_exactly_at_the_carry_baseline(tmp_path, pattern):
+    """The student predicts a residual and is zero-initialized, so at step 0 its
+    loss must equal ``carry_mse`` exactly and buy no improvement at all."""
+    trainer, _ = make_trainer(tmp_path, pattern=pattern)
     items = list(trainer.dataset)[:1]
     guided, latents, context = cached_batch(trainer, items)
     out = trainer.supervised_teacher_forced(guided, latents, context)
     for rec in out["per_step"]:
-        assert rec["loss"] != pytest.approx(0.0, abs=1e-12)
+        assert rec["loss"] == pytest.approx(rec["carry_mse"], rel=1e-6)
+        assert rec["relative_improvement"] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_gradients_reach_the_student_through_the_supervised_loss(tmp_path):
+    """The zero-init output head gates everything upstream on the first
+    backward, so only it moves; the rest must unlock on the next step."""
     trainer, head = make_trainer(tmp_path)
     items = list(trainer.dataset)[:1]
     guided, latents, context = cached_batch(trainer, items)
+
     trainer.supervised_teacher_forced(guided, latents, context)["loss"].backward()
-    assert any(
-        p.grad is not None and p.grad.abs().sum() > 0 for p in head.dit.parameters()
-    )
+    assert head.dit.head.head.weight.grad.abs().sum() > 0
+    assert head.fusion.net[-1].weight.grad.abs().sum() == 0
+
+    trainer.head_opt.step()
+    trainer.head_opt.zero_grad(set_to_none=True)
+
+    trainer.supervised_teacher_forced(guided, latents, context)["loss"].backward()
     assert head.fusion.net[-1].weight.grad.abs().sum() > 0
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for block in head.dit.blocks
+        for p in block.parameters()
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -256,8 +269,17 @@ def test_head_step_routes_the_sparse_variant_and_returns_a_latent_velocity(tmp_p
         )
     assert noise_pred.shape == LATENT_SHAPE
     assert v_tokens.shape == prev.shape
-    # The sparse student predicts outright; it must not be a carry residual.
-    assert not torch.allclose(v_tokens, prev)
+    # Zero-initialized: head_step must add an exactly-zero residual, i.e. carry.
+    assert torch.equal(v_tokens, prev)
+
+    # Once the output head is off zero, head_step must actually move the tokens.
+    torch.nn.init.normal_(head.dit.head.head.weight, std=0.02)
+    with torch.no_grad():
+        _, moved = head_step(
+            head, torch.tensor([500.0]), prev, GRID, PATCH_SIZE,
+            current_latents=latents, context=torch.randn(1, 4, TEXT_DIM),
+        )
+    assert not torch.allclose(moved, prev)
 
 
 def test_head_step_rejects_a_missing_context(tmp_path):

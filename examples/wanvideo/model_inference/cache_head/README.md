@@ -51,17 +51,25 @@ current latent x_k   ----------------------------- '                      |
 
 - **Weights are inherited**, not retrained from scratch. Wan's `AttentionModule`
   owns no parameters, so swapping it leaves `state_dict()` byte-identical.
-- **The conv's last layer is zero-initialized**, so at step 0 the fused input is
-  exactly `x_k`, the DiT sees precisely its native input distribution, and no
-  warm-up phase is needed. With `--sparse-pattern dense` the student then
-  reproduces a positive-context teacher forward *bit-for-bit* (pinned by
-  `test_dense_student_reproduces_the_teacher_exactly`).
-- **A head step is a single forward with positive context only.** The student
-  predicts the CFG-guided velocity outright; classifier-free guidance is
-  distilled into its weights. There is no residual add onto `prev_guided` —
-  the previous prediction reaches the model only through the conv fusion.
-  Early loss is therefore large by construction; `carry_mse` and
-  `relative_improvement` are the meaningful references, not the absolute value.
+- **The student predicts a residual**, exactly like every other variant:
+  `v_hat_k = v_{k-1} + student(v_{k-1}, x_k, t_k, ctx_posi)`.
+- **Two things are zero-initialized.** The conv's last layer, so the fused input
+  starts as exactly `x_k` and the DiT sees its native input distribution (this is
+  what removes the need for a warm-up phase); and the DiT's output head
+  (`dit.head.head`), so the residual starts at exactly zero and a fresh student
+  is `carry_previous` bit-for-bit. Zeroing the output head is *not optional* for
+  a residual formulation — keeping the teacher's head would give
+  `v_{k-1} + v_posi(x_k)`, roughly double the correct magnitude.
+- **A head step is a single forward with positive context only**, with
+  classifier-free guidance distilled into the weights.
+- Because the output head starts at zero, the first backward gives gradient to
+  that head *only* — the DiT blocks and the conv adapter are gated until it
+  moves off zero, then unlock on the next step. This is the usual price of a
+  zero-init residual (the legacy `CacheHead` behaves the same way) and is pinned
+  by `test_zero_init_output_gates_the_first_backward_then_unlocks`.
+- Weight inheritance is verified separately, with the zero-init disabled: a
+  dense student then reproduces a positive-context teacher forward *bit-for-bit*
+  (`test_dense_student_reproduces_the_teacher_exactly_without_the_zero_init`).
 - **Everything trains**: the full DiT plus the adapter (~1.3B parameters,
   roughly 10 GB/rank of params + grads + AdamW state in bf16). Activation
   checkpointing is on by default and is effectively required at S=32,760.
@@ -87,7 +95,8 @@ collapsing the 70% term to almost nothing — after which the **FFN dominates at
 # 1. measure which blocks actually move the residual stream
 python profile_block_importance.py --captions mixkit_captions.jsonl --keep 15
 
-# 2. sanity check: dense + full depth must match the teacher
+# 2. sanity check: step-0 loss must equal carry_mse exactly (zero residual),
+#    and relative_improvement must start at 0 and then climb
 python cache_head_model_training.py --arm supervised --head-variant sparse_dit \
     --sparse-pattern dense --captions mixkit_captions.jsonl --subset 2 --epochs 1 \
     --micro-batch 1 --batch-size 1

@@ -578,23 +578,23 @@ class CacheHeadTrainer:
             previous_teacher = teacher_guided[:, k - 1].detach()
             teacher_target = teacher_guided[:, k].detach()
             if is_sparse_dit:
-                # The sparse student predicts the guided velocity outright --
-                # CFG is distilled into its weights, and the previous guided
-                # prediction reaches it through the conv3d fusion rather than
-                # through an outer residual add.
-                student = self.head(
+                # A full DiT, but the same residual contract as every other
+                # variant: it sees the current latent through the conv3d fusion
+                # and the prompt through cross-attention.
+                residual = self.head(
                     previous_teacher, teacher_latents[:, k], self._t(k), context, self.grid
                 )
             elif teacher_latents is None:
-                student = previous_teacher + self.head(previous_teacher, self._t(k), self.grid)
+                residual = self.head(previous_teacher, self._t(k), self.grid)
             else:
                 latent_tokens = patchify_latents(
                     teacher_latents[:, k], self.grid, self.patch
                 )
-                student = previous_teacher + self.head(
+                residual = self.head(
                     previous_teacher, self._t(k), self.grid,
                     latent_tokens=latent_tokens,
                 )
+            student = previous_teacher + residual
             step_loss = F.mse_loss(student.float(), teacher_target.float())
             carry_loss = F.mse_loss(previous_teacher.float(), teacher_target.float())
             relative_improvement = 1.0 - step_loss / carry_loss.clamp_min(

@@ -24,10 +24,18 @@ The conv's last layer is zero-initialized, so at step 0 the fused input is
 *exactly* ``current_latents`` and the DiT sees precisely the distribution it was
 trained on.  That is why no warm-up phase is needed.
 
-Output is the guided velocity directly (``[B, S, 64]``): a single forward with
-positive context only, with classifier-free guidance distilled into the weights.
-There is no residual add onto ``prev_guided`` -- ``prev_guided`` enters solely
-through the conv fusion.
+The model predicts a **residual** on the previous guided velocity, matching
+``CacheHead``'s convention::
+
+    v_hat_k = v_{k-1} + student(v_{k-1}, x_k, t_k, ctx_posi)
+
+The DiT's output head is zero-initialized too, so a fresh student emits exactly
+zero and reproduces ``carry_previous`` bit-for-bit.  That zeroing is not
+optional for a residual formulation: keeping the teacher's head would yield
+``v_{k-1} + v_posi(x_k)``, roughly double the correct magnitude.
+
+A head step is a single forward with positive context only, with classifier-free
+guidance distilled into the weights.
 """
 
 from __future__ import annotations
@@ -161,6 +169,7 @@ class SparseCacheHead(nn.Module):
         *,
         use_gradient_checkpointing: bool = True,
         attention_block_size: int = DEFAULT_BLOCK_SIZE,
+        zero_init_output: bool = True,
     ):
         super().__init__()
         if config.head_variant != SPARSE_DIT_VARIANT:
@@ -195,6 +204,16 @@ class SparseCacheHead(nn.Module):
         )
         install_sparse_attention(dit, self.pattern, block_size=attention_block_size)
 
+        # The student predicts a residual on the previous guided velocity, so a
+        # fresh student must emit exactly zero.  Keeping the teacher's output
+        # head instead would give ``prev_guided + v_posi(x_k)`` -- roughly double
+        # the correct magnitude -- so zeroing it is what makes the residual
+        # formulation start from the carry_previous baseline.
+        self.zero_init_output = zero_init_output
+        if zero_init_output:
+            nn.init.zeros_(dit.head.head.weight)
+            nn.init.zeros_(dit.head.head.bias)
+
         self.dit = dit
         self.patch_size = tuple(int(p) for p in teacher_dit.patch_size)
         self.fusion = LatentFusionConv3d(
@@ -228,7 +247,12 @@ class SparseCacheHead(nn.Module):
         context: torch.Tensor,
         grid,
     ) -> torch.Tensor:
-        """Return the predicted guided velocity tokens ``[B, S, 64]``.
+        """Return the predicted *residual* ``[B, S, 64]``.
+
+        The caller adds it to ``prev_guided_tokens``, matching ``CacheHead``'s
+        convention:  ``v_hat = prev_guided + student(...)``.  With
+        ``zero_init_output`` the residual is exactly zero at init, so a fresh
+        student reproduces ``carry_previous`` bit-for-bit.
 
         ``context`` is the *positive* prompt embedding only: CFG is distilled
         into the weights, so a head step is a single forward.
@@ -242,7 +266,7 @@ class SparseCacheHead(nn.Module):
             return_noise_tokens=True,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
         )
-        return noise_tokens
+        return noise_tokens  # the residual; the caller adds prev_guided
 
     # -- reporting -----------------------------------------------------
 

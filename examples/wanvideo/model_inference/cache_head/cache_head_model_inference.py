@@ -74,11 +74,12 @@ def head_step(
     head, timestep, prev_guided_tokens, grid, patch_size, current_latents=None,
     context=None,
 ):
-    """CacheHead denoising step, unpatchified to the latent velocity.
+    """CacheHead denoising step: residual on the nearest preceding guided
+    tokens, unpatchified to the latent velocity.
 
-    Most variants predict a residual on the nearest preceding guided tokens.
-    ``sparse_dit`` instead predicts the guided velocity outright from a single
-    positive-context forward, with CFG distilled into its weights.
+    Every variant predicts a residual; they differ only in what they are allowed
+    to condition on.  ``sparse_dit`` additionally sees the positive prompt, since
+    it is a real DiT with cross-attention.
 
     Returns (noise_pred [B,C,F,H,W], v_tokens [B,S,64]).
     """
@@ -94,7 +95,8 @@ def head_step(
                 "head variant 'sparse_dit' requires the positive prompt context; it is a "
                 "DiT with cross-attention, not a text-blind token head"
             )
-        v_tokens = head(prev_guided_tokens, current_latents, timestep, context, grid)
+        residual = head(prev_guided_tokens, current_latents, timestep, context, grid)
+        v_tokens = prev_guided_tokens + residual
         return unpatchify_tokens(v_tokens, grid, patch_size), v_tokens
     if variant == "legacy":
         # Preserve the historical three-argument call graph for version-1/2

@@ -1,8 +1,10 @@
 """CPU-runnable tests for the sparse-attention CacheHead student.
 
-The load-bearing test here is :func:`test_dense_student_reproduces_the_teacher_exactly`:
-it proves weight inheritance, the zero-init conv fusion, and the attention swap
-are all correct simultaneously.
+Two load-bearing tests:
+``test_dense_student_reproduces_the_teacher_exactly_without_the_zero_init``
+proves weight inheritance, the conv fusion, and the attention swap are all
+correct simultaneously; ``test_zero_init_is_exact_carry_for_every_pattern``
+proves the shipped configuration starts from the carry_previous baseline.
 
 Run from the repo root or the cache_head dir:
     pytest examples/wanvideo/model_inference/cache_head/tests/test_sparse_cache_head.py
@@ -173,7 +175,9 @@ def test_fusion_requires_an_odd_kernel(kernel_size):
 
 def test_student_inherits_every_teacher_weight():
     teacher = tiny_teacher()
-    student = SparseCacheHead(teacher, sparse_config(), use_gradient_checkpointing=False)
+    student = SparseCacheHead(
+        teacher, sparse_config(), use_gradient_checkpointing=False, zero_init_output=False
+    )
     teacher_sd, student_sd = teacher.state_dict(), student.dit.state_dict()
     assert set(teacher_sd) == set(student_sd)
     assert all(torch.equal(teacher_sd[k], student_sd[k]) for k in teacher_sd)
@@ -205,11 +209,38 @@ def test_student_is_trainable_even_though_the_teacher_is_frozen():
     assert not any(p.requires_grad for p in teacher.parameters())
 
 
-def test_dense_student_reproduces_the_teacher_exactly():
-    """The single most important guarantee: with the dense pattern and a
-    zero-init fusion, the student IS the teacher."""
+def test_zero_init_student_emits_exactly_zero_residual():
+    """The student predicts a residual, so a fresh one must be exactly
+    carry_previous -- the same guarantee the token-space heads give."""
     teacher = tiny_teacher()
     student = SparseCacheHead(teacher, sparse_config(), use_gradient_checkpointing=False).eval()
+    prev, latents, timestep, context = sample_inputs()
+    with torch.no_grad():
+        residual = student(prev, latents, timestep, context, GRID)
+    assert torch.equal(residual, torch.zeros_like(residual))
+
+
+@pytest.mark.parametrize("pattern", ["dense", "spatiotemporal_window"])
+def test_zero_init_is_exact_carry_for_every_pattern(pattern):
+    teacher = tiny_teacher()
+    student = SparseCacheHead(
+        teacher, sparse_config(sparse_pattern=pattern, sparse_spatial_radius=1),
+        use_gradient_checkpointing=False,
+    ).eval()
+    prev, latents, timestep, context = sample_inputs()
+    with torch.no_grad():
+        v_tokens = prev + student(prev, latents, timestep, context, GRID)
+    assert torch.equal(v_tokens, prev)
+
+
+def test_dense_student_reproduces_the_teacher_exactly_without_the_zero_init():
+    """Weight inheritance, the conv fusion, and the attention swap are all
+    correct if -- with the output head left as the teacher's -- a dense student
+    reproduces a positive-context teacher forward bit-for-bit."""
+    teacher = tiny_teacher()
+    student = SparseCacheHead(
+        teacher, sparse_config(), use_gradient_checkpointing=False, zero_init_output=False
+    ).eval()
     prev, latents, timestep, context = sample_inputs()
     with torch.no_grad():
         _, expected = teacher(x=latents, timestep=timestep, context=context, return_noise_tokens=True)
@@ -224,12 +255,26 @@ def test_sparse_student_diverges_from_the_teacher():
         sparse_config(sparse_pattern="spatiotemporal_window", sparse_spatial_radius=1,
                       sparse_temporal_radius=0),
         use_gradient_checkpointing=False,
+        zero_init_output=False,
     ).eval()
     prev, latents, timestep, context = sample_inputs()
     with torch.no_grad():
         _, expected = teacher(x=latents, timestep=timestep, context=context, return_noise_tokens=True)
         actual = student(prev, latents, timestep, context, GRID)
     assert not torch.allclose(actual, expected, atol=1e-4)
+
+
+def test_zero_init_touches_only_the_output_head():
+    """Everything except the final projection must still be the teacher's."""
+    teacher = tiny_teacher()
+    student = SparseCacheHead(teacher, sparse_config(), use_gradient_checkpointing=False)
+    teacher_sd, student_sd = teacher.state_dict(), student.dit.state_dict()
+    zeroed = {"head.head.weight", "head.head.bias"}
+    for key in teacher_sd:
+        if key in zeroed:
+            assert torch.equal(student_sd[key], torch.zeros_like(student_sd[key]))
+        else:
+            assert torch.equal(student_sd[key], teacher_sd[key]), key
 
 
 def test_kept_blocks_carry_their_source_teacher_weights():
@@ -296,7 +341,7 @@ def test_forward_returns_guided_velocity_tokens():
 def test_gradients_reach_the_whole_dit_and_the_fusion():
     student = SparseCacheHead(
         tiny_teacher(), sparse_config(sparse_pattern="spatiotemporal_window"),
-        use_gradient_checkpointing=False,
+        use_gradient_checkpointing=False, zero_init_output=False,
     )
     student.train()
     prev, latents, timestep, context = sample_inputs()
@@ -315,7 +360,7 @@ def test_fusion_input_conv_activates_once_the_output_conv_leaves_zero():
     output conv moves -- otherwise the adapter would be permanently dead."""
     student = SparseCacheHead(
         tiny_teacher(), sparse_config(sparse_pattern="spatiotemporal_window"),
-        use_gradient_checkpointing=False,
+        use_gradient_checkpointing=False, zero_init_output=False,
     )
     student.train()
     prev, latents, timestep, context = sample_inputs()
@@ -332,11 +377,45 @@ def test_fusion_input_conv_activates_once_the_output_conv_leaves_zero():
     assert student.fusion.net[0].weight.grad.abs().sum() > 0
 
 
+def test_zero_init_output_gates_the_first_backward_then_unlocks():
+    """A zero-init output head means the whole graph upstream of it starts with
+    zero gradient -- only the head itself moves on step one.  This is the usual
+    price of a zero-init residual, but it must actually unlock afterwards
+    rather than leaving the student permanently dead."""
+    student = SparseCacheHead(
+        tiny_teacher(), sparse_config(sparse_pattern="spatiotemporal_window"),
+        use_gradient_checkpointing=False,
+    )
+    student.train()
+    prev, latents, timestep, context = sample_inputs()
+    target = torch.randn(1, NUM_TOKENS, 64)
+
+    torch.nn.functional.mse_loss(
+        prev + student(prev, latents, timestep, context, GRID), target
+    ).backward()
+    assert student.dit.head.head.weight.grad.abs().sum() > 0
+    assert student.fusion.net[-1].weight.grad.abs().sum() == 0
+    assert student.dit.blocks[0].self_attn.q.weight.grad.abs().sum() == 0
+
+    torch.optim.SGD(student.parameters(), lr=0.1).step()
+    student.zero_grad(set_to_none=True)
+
+    torch.nn.functional.mse_loss(
+        prev + student(prev, latents, timestep, context, GRID), target
+    ).backward()
+    assert student.fusion.net[-1].weight.grad.abs().sum() > 0
+    assert student.dit.blocks[0].self_attn.q.weight.grad.abs().sum() > 0
+
+
 def test_gradient_checkpointing_matches_the_plain_forward():
     teacher = tiny_teacher()
     config = sparse_config(sparse_pattern="spatiotemporal_window")
-    plain = SparseCacheHead(teacher, config, use_gradient_checkpointing=False).train()
-    checkpointed = SparseCacheHead(teacher, config, use_gradient_checkpointing=True).train()
+    plain = SparseCacheHead(
+        teacher, config, use_gradient_checkpointing=False, zero_init_output=False
+    ).train()
+    checkpointed = SparseCacheHead(
+        teacher, config, use_gradient_checkpointing=True, zero_init_output=False
+    ).train()
     checkpointed.load_state_dict(plain.state_dict())
     prev, latents, timestep, context = sample_inputs()
     torch.testing.assert_close(
@@ -387,7 +466,9 @@ def test_checkpoint_round_trip_rebuilds_the_architecture_and_outputs():
         student_layer_indices=(0, 3, 5),
         fusion_hidden_channels=24,
     )
-    student = SparseCacheHead(teacher, config, use_gradient_checkpointing=False)
+    student = SparseCacheHead(
+        teacher, config, use_gradient_checkpointing=False, zero_init_output=False
+    )
     # Move off the zero-init so the round-trip is not trivially satisfied.
     torch.nn.init.normal_(student.fusion.net[-1].weight, std=0.05)
     student.eval()
