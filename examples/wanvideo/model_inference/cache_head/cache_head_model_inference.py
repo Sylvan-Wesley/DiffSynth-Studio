@@ -35,12 +35,14 @@ from pathlib import Path
 import torch
 
 from cache_head_model import (
+    SPARSE_DIT_VARIANT,
     CacheHead,
     CacheHeadConfig,
     CacheHeadSchedule,
     load_cache_head,
     patchify_latents,
     parse_full_step_indices,
+    peek_head_variant,
     unpatchify_tokens,
 )
 
@@ -69,10 +71,14 @@ def full_step(dit, latents, timestep, ctx_posi, ctx_nega, cfg_scale, **dit_kwarg
 
 
 def head_step(
-    head, timestep, prev_guided_tokens, grid, patch_size, current_latents=None
+    head, timestep, prev_guided_tokens, grid, patch_size, current_latents=None,
+    context=None,
 ):
-    """CacheHead denoising step: residual on the nearest preceding guided
-    tokens, unpatchified to the latent velocity.
+    """CacheHead denoising step, unpatchified to the latent velocity.
+
+    Most variants predict a residual on the nearest preceding guided tokens.
+    ``sparse_dit`` instead predicts the guided velocity outright from a single
+    positive-context forward, with CFG distilled into its weights.
 
     Returns (noise_pred [B,C,F,H,W], v_tokens [B,S,64]).
     """
@@ -80,6 +86,16 @@ def head_step(
     if config is None and hasattr(head, "module"):
         config = getattr(head.module, "config", None)
     variant = getattr(config, "head_variant", "legacy")
+    if variant == "sparse_dit":
+        if current_latents is None:
+            raise ValueError("head variant 'sparse_dit' requires the live current latent")
+        if context is None:
+            raise ValueError(
+                "head variant 'sparse_dit' requires the positive prompt context; it is a "
+                "DiT with cross-attention, not a text-blind token head"
+            )
+        v_tokens = head(prev_guided_tokens, current_latents, timestep, context, grid)
+        return unpatchify_tokens(v_tokens, grid, patch_size), v_tokens
     if variant == "legacy":
         # Preserve the historical three-argument call graph for version-1/2
         # checkpoints and lightweight test/dummy heads.
@@ -148,7 +164,7 @@ class HybridSampler:
                 before = prev_guided
                 noise_pred, prev_guided = head_step(
                     self.head, t, prev_guided, self.grid, self.patch_size,
-                    current_latents=latents,
+                    current_latents=latents, context=ctx_posi,
                 )
                 residual = prev_guided - before
                 changed = (prev_guided != before).float().mean().item()
@@ -301,8 +317,19 @@ def run_pipeline(args) -> None:
     # Head + config.
     config = None
     if args.checkpoint:
-        head, config = load_cache_head(args.checkpoint, device=device, dtype=dtype)
-        print(f"Loaded CacheHead from {args.checkpoint} (cfg={config.cfg_scale})")
+        if peek_head_variant(args.checkpoint) == SPARSE_DIT_VARIANT:
+            from sparse_cache_head import load_sparse_cache_head
+
+            head, config = load_sparse_cache_head(
+                args.checkpoint, dit, device=device, dtype=dtype
+            )
+            print(
+                f"Loaded SparseCacheHead from {args.checkpoint} "
+                f"(cfg={config.cfg_scale}, {head.parameter_summary()})"
+            )
+        else:
+            head, config = load_cache_head(args.checkpoint, device=device, dtype=dtype)
+            print(f"Loaded CacheHead from {args.checkpoint} (cfg={config.cfg_scale})")
     else:
         config = CacheHeadConfig(model_id=args.model_id, cfg_scale=args.cfg)
         head = CacheHead(config).to(device=device, dtype=dtype).eval()

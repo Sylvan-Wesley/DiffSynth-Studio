@@ -46,6 +46,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cache_head_model import (
+    SPARSE_DIT_VARIANT,
     WAN_NOISE_TOKEN_CHANNELS,
     CacheHead,
     CacheHeadConfig,
@@ -59,6 +60,8 @@ from cache_head_model import (
 from cache_head_model_inference import full_step, head_step
 from cache_head_ddp import DistributedContext, initialize_distributed
 from fake_score_wan import FakeScoreWan
+from sparse_attention import SPARSE_PATTERNS
+from sparse_cache_head import SparseCacheHead, resolve_layer_indices, save_sparse_cache_head
 
 
 # Arms that train a head.  ``carry_previous`` is the explicit zero-residual
@@ -326,6 +329,13 @@ class CacheHeadTrainer:
         self._trajectory_fingerprint_value: str | None = None
         self.trajectory_cache_hits = 0
         self.trajectory_cache_misses = 0
+        self.context_cache_hits = 0
+        self.context_cache_misses = 0
+        # Only the sparse_dit student has cross-attention; the token-space heads
+        # never see the prompt, so they skip the embedding cache entirely.
+        self.needs_context = (
+            self.distributed.unwrap(self.head).config.head_variant == SPARSE_DIT_VARIANT
+        )
 
     # ---- sampling --------------------------------------------------------
 
@@ -393,12 +403,12 @@ class CacheHeadTrainer:
             else:
                 noise_pred, prev_guided = head_step(
                     self.head, t, prev_guided, self.grid, self.patch,
-                    current_latents=latents,
+                    current_latents=latents, context=ctx,
                 )
             latents = self.scheduler.step(noise_pred, t, latents)
         return latents, prev_guided
 
-    def _head_step_grad(self, latents, prev_guided, step_j: int):
+    def _head_step_grad(self, latents, prev_guided, step_j: int, context=None):
         """CacheHead update at step j WITH gradients.  Returns
         (v_tokens, noise_pred, x0_G, t_j, sigma_j, head_out).
 
@@ -409,7 +419,7 @@ class CacheHeadTrainer:
         sigma_j = self._sigma(step_j)
         noise_pred, v_tokens = head_step(
             self.head, t_j, prev_guided, self.grid, self.patch,
-            current_latents=latents,
+            current_latents=latents, context=context,
         )
         head_out = v_tokens - prev_guided
         x0_G = flow_to_x0(latents, noise_pred, sigma_j)
@@ -428,7 +438,9 @@ class CacheHeadTrainer:
         """no_grad generator x0 prediction at the sampled head step."""
         latents, prev_guided = self._prefix_roll(sample["z"], sample["ctx"], sample["step_j"])
         with torch.no_grad():
-            _, _, x0_G, _, _, _ = self._head_step_grad(latents, prev_guided, sample["step_j"])
+            _, _, x0_G, _, _, _ = self._head_step_grad(
+                latents, prev_guided, sample["step_j"], sample["ctx"]
+            )
         return x0_G
 
     # ---- loss arms -------------------------------------------------------
@@ -436,7 +448,7 @@ class CacheHeadTrainer:
     def regression(self, sample: dict) -> dict:
         latents, prev_guided = self._prefix_roll(sample["z"], sample["ctx"], sample["step_j"])
         v_tokens, _, x0_G, t_j, _, head_out = self._head_step_grad(
-            latents, prev_guided, sample["step_j"]
+            latents, prev_guided, sample["step_j"], sample["ctx"]
         )
         with torch.no_grad():
             _, teacher_tokens = full_step(self.dit, latents, t_j, sample["ctx"], self.neg_ctx, self.cfg)
@@ -446,7 +458,7 @@ class CacheHeadTrainer:
     def dmd(self, sample: dict) -> dict:
         latents, prev_guided = self._prefix_roll(sample["z"], sample["ctx"], sample["step_j"])
         v_tokens, _, x0_G, t_j, _, head_out = self._head_step_grad(
-            latents, prev_guided, sample["step_j"]
+            latents, prev_guided, sample["step_j"], sample["ctx"]
         )
         # Perturb the generated x0 and query teacher + fake-score at the same state.
         sigma, t = self._match_sigma(x0_G.shape[0])
@@ -515,12 +527,17 @@ class CacheHeadTrainer:
         self,
         teacher_guided: torch.Tensor,
         initial_latents: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
     ) -> dict:
         """MSE between student and teacher velocities on student steps only.
 
         ``teacher_guided[:, k-1]`` is the student's carry at step ``k`` and
         ``teacher_guided[:, k]`` is its target.  Both are from the fixed full
         teacher rollout, so no student prediction is fed into a later step.
+
+        ``context`` is the positive prompt embedding, required only by the
+        ``sparse_dit`` variant: it is a real DiT with cross-attention, unlike the
+        token-space heads, which are text-blind.
         """
         n_batch = teacher_guided.shape[0]
         expected = (
@@ -535,6 +552,7 @@ class CacheHeadTrainer:
                 f"{tuple(teacher_guided.shape)}"
             )
         head_config = self.distributed.unwrap(self.head).config
+        is_sparse_dit = head_config.head_variant == SPARSE_DIT_VARIANT
         teacher_latents = None
         if head_config.head_variant != "legacy":
             if initial_latents is None:
@@ -543,6 +561,11 @@ class CacheHeadTrainer:
                 )
             teacher_latents = self.reconstruct_teacher_latents(
                 initial_latents, teacher_guided
+            )
+        if is_sparse_dit and context is None:
+            raise ValueError(
+                "head_variant 'sparse_dit' requires the positive prompt context; it is a "
+                "DiT with cross-attention, not a text-blind token head"
             )
 
         total = None
@@ -554,17 +577,24 @@ class CacheHeadTrainer:
                 raise RuntimeError("step 1 must be a dense/full-teacher step")
             previous_teacher = teacher_guided[:, k - 1].detach()
             teacher_target = teacher_guided[:, k].detach()
-            if teacher_latents is None:
-                residual = self.head(previous_teacher, self._t(k), self.grid)
+            if is_sparse_dit:
+                # The sparse student predicts the guided velocity outright --
+                # CFG is distilled into its weights, and the previous guided
+                # prediction reaches it through the conv3d fusion rather than
+                # through an outer residual add.
+                student = self.head(
+                    previous_teacher, teacher_latents[:, k], self._t(k), context, self.grid
+                )
+            elif teacher_latents is None:
+                student = previous_teacher + self.head(previous_teacher, self._t(k), self.grid)
             else:
                 latent_tokens = patchify_latents(
                     teacher_latents[:, k], self.grid, self.patch
                 )
-                residual = self.head(
+                student = previous_teacher + self.head(
                     previous_teacher, self._t(k), self.grid,
                     latent_tokens=latent_tokens,
                 )
-            student = previous_teacher + residual
             step_loss = F.mse_loss(student.float(), teacher_target.float())
             carry_loss = F.mse_loss(previous_teacher.float(), teacher_target.float())
             relative_improvement = 1.0 - step_loss / carry_loss.clamp_min(
@@ -587,7 +617,9 @@ class CacheHeadTrainer:
     def supervised_trajectory(self, batch: dict) -> dict:
         """Build an in-memory full-teacher trajectory, then train from it."""
         teacher_guided = self.teacher_guided_trajectory(batch)
-        return self.supervised_teacher_forced(teacher_guided, batch["z"])
+        return self.supervised_teacher_forced(
+            teacher_guided, batch["z"], batch["ctx"] if self.needs_context else None
+        )
 
     # ---- persistent full-teacher trajectory cache ----------------------
 
@@ -747,6 +779,78 @@ class CacheHeadTrainer:
         ]
         return torch.stack(loaded, dim=0)
 
+    # ---- persistent prompt-embedding cache -----------------------------
+    #
+    # The ``sparse_dit`` student has cross-attention, so it needs the positive
+    # prompt embedding at every head step.  A text embedding depends only on the
+    # caption and the text encoder -- not on the schedule, seed, or cfg scale --
+    # so it gets its own cache directory rather than riding on the trajectory
+    # fingerprint.  At ~4 MB per prompt against the trajectory's ~63 MB this is
+    # cheap, and caching it is what lets umT5-XXL leave the GPU during training.
+
+    def _context_path(self, caption: str) -> Path:
+        if self.trajectory_dir is None:
+            raise RuntimeError("a trajectory_dir is required to cache prompt embeddings")
+        return Path(self.trajectory_dir) / "contexts" / f"{self._caption_hash(caption)}.pt"
+
+    def _save_context(self, path: Path, context: torch.Tensor, *, caption: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "metadata": {"schema": 1, "caption_sha256": self._caption_hash(caption)},
+            "context": context.detach().cpu().contiguous(),
+        }
+        temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{self.distributed.rank}")
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+
+    def _load_context(self, path: Path, *, caption: str) -> torch.Tensor:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            raise RuntimeError(f"could not load prompt-embedding cache {path}: {exc}") from exc
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        if metadata.get("caption_sha256") != self._caption_hash(caption):
+            raise RuntimeError(
+                f"prompt-embedding cache {path} does not match its caption; remove that file "
+                "or use a different --trajectory-dir"
+            )
+        context = payload.get("context")
+        if not isinstance(context, torch.Tensor) or context.dim() != 2:
+            raise RuntimeError(f"prompt-embedding cache {path} does not hold a [L, D] tensor")
+        if not torch.isfinite(context.float()).all():
+            raise RuntimeError(f"prompt-embedding cache {path} contains NaN or Inf")
+        return context.contiguous()
+
+    def load_context_batch(self, items: list[tuple[str, str]]) -> torch.Tensor:
+        """Positive prompt embeddings ``[B, L, D]``, generating cache misses in one batch."""
+        paths = [self._context_path(caption) for _, caption in items]
+        missing = [i for i, path in enumerate(paths) if not path.is_file()]
+        self.context_cache_hits += len(items) - len(missing)
+        self.context_cache_misses += len(missing)
+
+        if missing:
+            encoded = self.encode_captions([items[i][1] for i in missing]).detach().cpu()
+            for local_i, source_i in enumerate(missing):
+                self._save_context(
+                    paths[source_i], encoded[local_i], caption=items[source_i][1]
+                )
+
+        loaded = [
+            self._load_context(path, caption=caption)
+            for path, (_, caption) in zip(paths, items)
+        ]
+        return torch.stack(loaded, dim=0).to(device=self.device, dtype=self.dtype)
+
+    def prefetch_split(self, dataset, *, split: str) -> None:
+        """Warm both caches for an entire split so the teacher and text encoder
+        can leave the GPU before training starts."""
+        items = list(dataset)
+        for start in range(0, len(items), self.micro_batch):
+            chunk = items[start : start + self.micro_batch]
+            self.load_teacher_batch(chunk, split=split)
+            if self.needs_context:
+                self.load_context_batch(chunk)
+
     def fake_score_update(self, sample: dict) -> torch.Tensor:
         """Denoising loss for the LoRA fake-score on a stop-grad generated sample."""
         x0_G = self._generator_x0(sample)
@@ -782,7 +886,21 @@ class CacheHeadTrainer:
 
         torch.cuda.reset_peak_memory_stats()
         try:
-            if training_type == "supervised":
+            if training_type == "supervised" and self.needs_context:
+                # Probe the sparse student the way it is actually trained: from
+                # the on-disk caches.  Rolling a fresh teacher trajectory here
+                # would both mismeasure the peak (the teacher dominates it) and
+                # fail outright once --prefetch-and-offload has moved the teacher
+                # and text encoder to CPU.
+                items = list(self.dataset)[:micro]
+                out = self.supervised_teacher_forced(
+                    self.load_teacher_batch(items, split="train").to(
+                        device=self.device, dtype=self.dtype
+                    ),
+                    self.deterministic_initial_latents(items, split="train"),
+                    self.load_context_batch(items),
+                )
+            elif training_type == "supervised":
                 out = self.supervised_trajectory(self.sample_batch(micro))
             else:
                 # Representative of the DMD loop: prefix + teacher query + head backward.
@@ -902,7 +1020,8 @@ class CacheHeadTrainer:
                 device=self.device, dtype=self.dtype
             )
             initial_latents = self.deterministic_initial_latents(items, split="val")
-            out = self.supervised_teacher_forced(teacher_guided, initial_latents)
+            context = self.load_context_batch(items) if self.needs_context else None
+            out = self.supervised_teacher_forced(teacher_guided, initial_latents, context)
             overall += float(out["loss"].detach().item())
             for rec in out["per_step"]:
                 totals[rec["step"]] = totals.get(rec["step"], 0.0) + rec["loss"]
@@ -965,6 +1084,7 @@ class CacheHeadTrainer:
                     cached_micro_batches.append((
                         self.load_teacher_batch(chunk, split="train"),
                         self.deterministic_initial_latents(chunk, split="train"),
+                        self.load_context_batch(chunk) if self.needs_context else None,
                     ))
 
                 iteration = epoch * steps_per_epoch + iteration_in_epoch
@@ -974,13 +1094,15 @@ class CacheHeadTrainer:
                     per_step_acc: dict[int, float] = {}
                     per_step_carry_acc: dict[int, float] = {}
                     per_step_improvement_acc: dict[int, float] = {}
-                    for micro_step, (cached, initial_latents) in enumerate(cached_micro_batches):
+                    for micro_step, (cached, initial_latents, context) in enumerate(
+                        cached_micro_batches
+                    ):
                         with self.distributed.no_sync(
                             self.head, enabled=micro_step < accum - 1
                         ):
                             teacher_guided = cached.to(device=self.device, dtype=self.dtype)
                             out = self.supervised_teacher_forced(
-                                teacher_guided, initial_latents
+                                teacher_guided, initial_latents, context
                             )
                             (out["loss"] / accum).backward()
                             micro_losses.append(float(out["loss"].detach().item()))
@@ -1147,6 +1269,8 @@ class CacheHeadTrainer:
             schedule=self.schedule,
             cfg_scale=self.cfg,
         )
+        if cfg.head_variant == SPARSE_DIT_VARIANT:
+            return save_sparse_cache_head(head, cfg, path)
         return save_cache_head(head, cfg, path)
 
 
@@ -1166,6 +1290,49 @@ def main() -> None:
     parser.add_argument(
         "--head-variant", choices=list(HEAD_VARIANTS), default="legacy",
         help="CacheHead architecture for the controlled latent-conditioning ablation",
+    )
+    sparse = parser.add_argument_group(
+        "sparse_dit", "Only used by --head-variant sparse_dit (a teacher-inherited DiT)"
+    )
+    sparse.add_argument(
+        "--sparse-pattern", choices=sorted(SPARSE_PATTERNS), default="spatiotemporal_window",
+        help="self-attention sparsity pattern; 'dense' reproduces the teacher exactly",
+    )
+    sparse.add_argument(
+        "--sparse-spatial-radius", type=int, default=2,
+        help="within-frame Chebyshev radius; 2 gives the 5x5 window",
+    )
+    sparse.add_argument(
+        "--sparse-temporal-radius", type=int, default=2,
+        help="across-frame Chebyshev radius",
+    )
+    sparse.add_argument(
+        "--student-num-layers", type=int, default=None,
+        help="keep this many teacher blocks via a stride that retains the first and last; "
+             "the FFN dominates once attention is sparse, so depth is the main remaining lever",
+    )
+    sparse.add_argument(
+        "--student-layer-indices", type=parse_full_step_indices, default=None,
+        help="explicit 0-indexed teacher blocks to keep, e.g. 0,2,4 (overrides "
+             "--student-num-layers; choose these with profile_block_importance.py)",
+    )
+    sparse.add_argument(
+        "--fusion-hidden-channels", type=int, default=64,
+        help="width of the conv3d latent-fusion adapter",
+    )
+    sparse.add_argument(
+        "--fusion-kernel-size", type=int, default=3,
+        help="conv3d kernel for the latent-fusion adapter (odd)",
+    )
+    sparse.add_argument(
+        "--no-gradient-checkpointing", action="store_true",
+        help="disable activation checkpointing in the student DiT; at S=32760 this "
+             "will usually run out of memory",
+    )
+    sparse.add_argument(
+        "--prefetch-and-offload", action="store_true",
+        help="warm the trajectory and prompt-embedding caches for the whole split, then "
+             "move the teacher DiT and text encoder to CPU before training",
     )
     parser.add_argument("--captions", required=True, help="MixKit caption JSONL path")
     parser.add_argument("--model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
@@ -1273,6 +1440,24 @@ def main() -> None:
         parser.error("--heatmap-every must be non-negative")
     if args.log_interval <= 0:
         parser.error("--log-interval must be positive")
+    if args.head_variant == SPARSE_DIT_VARIANT:
+        # The sparse student is only wired into the teacher-forced supervised
+        # loop; the DMD arms roll the student forward through head_step and have
+        # not been validated against a full-size student.
+        if args.arm != "supervised":
+            parser.error("--head-variant sparse_dit currently requires --arm supervised")
+        if args.sparse_spatial_radius < 0 or args.sparse_temporal_radius < 0:
+            parser.error("sparse radii must be non-negative")
+        if args.fusion_hidden_channels < 1:
+            parser.error("--fusion-hidden-channels must be positive")
+        if args.fusion_kernel_size < 1 or args.fusion_kernel_size % 2 == 0:
+            parser.error("--fusion-kernel-size must be a positive odd int")
+        if args.student_num_layers is not None and args.student_num_layers < 1:
+            parser.error("--student-num-layers must be positive")
+        if args.student_num_layers is not None and args.student_layer_indices is not None:
+            print("--student-num-layers ignored: --student-layer-indices takes precedence")
+    elif args.prefetch_and_offload:
+        parser.error("--prefetch-and-offload only applies to --head-variant sparse_dit")
 
     apply_no_network(args)
 
@@ -1353,14 +1538,49 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         raise ValueError("supervised teacher forcing requires step 1 in --full-steps")
     if args.arm == "supervised" and schedule.num_head_steps == 0:
         raise ValueError("supervised teacher forcing requires at least one student step")
+    if args.head_variant == SPARSE_DIT_VARIANT:
+        version = 4
+    elif args.head_variant == "legacy":
+        version = 2
+    else:
+        version = 3
+    sparse_kwargs = {}
+    if args.head_variant == SPARSE_DIT_VARIANT:
+        # Resolve the depth request into explicit indices now, so the checkpoint
+        # records exactly which teacher blocks the student kept.
+        sparse_kwargs = {
+            "sparse_pattern": args.sparse_pattern,
+            "sparse_spatial_radius": args.sparse_spatial_radius,
+            "sparse_temporal_radius": args.sparse_temporal_radius,
+            "fusion_hidden_channels": args.fusion_hidden_channels,
+            "fusion_kernel_size": args.fusion_kernel_size,
+            # The fusion output feeds dit.patch_embedding directly, so its width
+            # is dictated by the DiT, not by the VAE.
+            "latent_channels": dit.in_dim,
+            "student_layer_indices": resolve_layer_indices(
+                len(dit.blocks),
+                num_layers=args.student_num_layers,
+                explicit=args.student_layer_indices,
+            ),
+        }
     config = CacheHeadConfig(
         model_id=args.model_id,
         schedule=schedule,
         cfg_scale=args.cfg,
         head_variant=args.head_variant,
-        version=2 if args.head_variant == "legacy" else 3,
+        version=version,
+        **sparse_kwargs,
     )
-    head = CacheHead(config).to(device=device, dtype=dtype)
+    if args.head_variant == SPARSE_DIT_VARIANT:
+        head = SparseCacheHead(
+            dit,
+            config,
+            use_gradient_checkpointing=not args.no_gradient_checkpointing,
+        ).to(device=device, dtype=dtype)
+        if distributed.is_main_process:
+            print(f"[sparse_dit] {head.parameter_summary()}")
+    else:
+        head = CacheHead(config).to(device=device, dtype=dtype)
     # FakeScoreWan deep-copies the whole DiT; only the DMD arms need it, and
     # skipping it frees that memory for a larger --micro-batch.
     if args.arm in DMD_ARMS:
@@ -1420,6 +1640,31 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         device=device, dtype=dtype, seed=args.seed + distributed.rank,
         distributed=distributed,
     )
+    if getattr(args, "prefetch_and_offload", False):
+        # The sparse student is ~1.3B trainable parameters; with both caches warm
+        # neither the teacher clone (~2.6 GB) nor umT5-XXL (~11 GB) is needed in
+        # the loop, and that memory is better spent on activations.
+        trainer.trajectory_dir = trainer.trajectory_dir or Path(args.save_dir) / "trajectories"
+        trainer.trajectory_dir.mkdir(parents=True, exist_ok=True)
+        if distributed.is_main_process:
+            print("[prefetch] warming teacher-trajectory and prompt-embedding caches")
+        trainer.prefetch_split(dataset, split="train")
+        if val_dataset is not None:
+            trainer.prefetch_split(val_dataset, split="val")
+        distributed.barrier()
+        dit.to("cpu")
+        pipe.text_encoder.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if distributed.is_main_process:
+            print(
+                f"[prefetch] done (trajectory hits/misses "
+                f"{trainer.trajectory_cache_hits}/{trainer.trajectory_cache_misses}, "
+                f"context hits/misses "
+                f"{trainer.context_cache_hits}/{trainer.context_cache_misses}); "
+                "teacher DiT and text encoder moved to CPU"
+            )
+
     wandb_run = initialize_wandb(args, distributed)
     try:
         trainer.train(

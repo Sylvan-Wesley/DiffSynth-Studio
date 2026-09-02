@@ -50,12 +50,26 @@ from einops import rearrange
 # Noise-token channel width produced by Wan's DiT head for Wan2.1.
 # C_tok = out_dim * prod(patch_size) = 16 * (1 * 2 * 2) = 64.
 WAN_NOISE_TOKEN_CHANNELS = 64
-HEAD_VARIANTS = (
+# Variants that ARE a CacheHead: lightweight networks over the [B, S, 64] token
+# grid, built by ``CacheHead(config)``.
+TOKEN_HEAD_VARIANTS = (
     "legacy",
     "latent_fusion",
     "latent_residual",
     "latent_residual_deep",
 )
+
+HEAD_VARIANTS = TOKEN_HEAD_VARIANTS + ("sparse_dit",)
+
+# ``sparse_dit`` is not a lightweight token-space head at all: it is a clone of
+# the teacher DiT with every self-attention replaced by a sparse one, fed by a
+# conv3d that fuses the previous guided velocity with the current latent.  It
+# lives in ``sparse_cache_head.py`` and is rebuilt by ``load_sparse_cache_head``,
+# because reconstructing it requires the teacher weights.
+SPARSE_DIT_VARIANT = "sparse_dit"
+
+# Wan2.1 latent channel count (``vae.model.z_dim`` / ``dit.in_dim``).
+WAN_LATENT_CHANNELS = 16
 
 
 @dataclass(frozen=True)
@@ -139,9 +153,22 @@ class CacheHeadConfig:
     adaln_dropout: float = 0.0
     residual_scale: float = 1.0
     head_variant: str = "legacy"
+    # ``sparse_dit`` knobs.  Ignored by every other variant, but carried in the
+    # checkpoint so inference rebuilds the identical block subset and pattern.
+    sparse_pattern: str = "dense"
+    sparse_spatial_radius: int = 2
+    sparse_temporal_radius: int = 2
+    student_layer_indices: tuple[int, ...] | None = None
+    fusion_hidden_channels: int = 64
+    fusion_kernel_size: int = 3
+    latent_channels: int = WAN_LATENT_CHANNELS
     version: int = 2
 
     def __post_init__(self) -> None:
+        # A list survives a JSON/torch.load round-trip as a list; normalize so
+        # equality and hashing stay stable across save/load.
+        if self.student_layer_indices is not None:
+            object.__setattr__(self, "student_layer_indices", tuple(self.student_layer_indices))
         if self.token_channels < 1:
             raise ValueError(f"token_channels must be >= 1, got {self.token_channels}")
         if self.cfg_scale < 1.0:
@@ -152,9 +179,32 @@ class CacheHeadConfig:
             raise ValueError(
                 f"head_variant must be one of {HEAD_VARIANTS}, got {self.head_variant!r}"
             )
-        if self.version not in (1, 2, 3):
-            raise ValueError(f"version must be 1, 2, or 3, got {self.version}")
-        if self.head_variant != "legacy" and self.version != 3:
+        if self.version not in (1, 2, 3, 4):
+            raise ValueError(f"version must be 1, 2, 3, or 4, got {self.version}")
+        if self.head_variant == SPARSE_DIT_VARIANT:
+            if self.version != 4:
+                raise ValueError("head_variant 'sparse_dit' requires checkpoint version 4")
+            if self.latent_channels < 1:
+                raise ValueError(f"latent_channels must be >= 1, got {self.latent_channels}")
+            if self.fusion_hidden_channels < 1:
+                raise ValueError(
+                    f"fusion_hidden_channels must be >= 1, got {self.fusion_hidden_channels}"
+                )
+            if self.fusion_kernel_size < 1 or self.fusion_kernel_size % 2 == 0:
+                raise ValueError(
+                    f"fusion_kernel_size must be a positive odd int, got {self.fusion_kernel_size}"
+                )
+            if self.student_layer_indices is not None:
+                idx = self.student_layer_indices
+                if len(idx) == 0:
+                    raise ValueError("student_layer_indices must be non-empty")
+                if len(set(idx)) != len(idx):
+                    raise ValueError(f"student_layer_indices must be unique, got {idx}")
+                if not all(a < b for a, b in zip(idx, idx[1:])):
+                    raise ValueError(f"student_layer_indices must be sorted ascending, got {idx}")
+                if any(i < 0 for i in idx):
+                    raise ValueError(f"student_layer_indices must be non-negative, got {idx}")
+        elif self.head_variant != "legacy" and self.version != 3:
             raise ValueError(
                 f"head_variant {self.head_variant!r} requires checkpoint version 3"
             )
@@ -321,6 +371,11 @@ class CacheHead(nn.Module):
 
     def __init__(self, config: CacheHeadConfig, *, zero_init_out_proj: bool = True):
         super().__init__()
+        if config.head_variant == SPARSE_DIT_VARIANT:
+            raise ValueError(
+                "head_variant 'sparse_dit' is not a CacheHead; build it with "
+                "sparse_cache_head.SparseCacheHead(teacher_dit, config)"
+            )
         self.config = config
         dim = config.token_channels
         hidden = dim * config.hidden_factor
@@ -487,8 +542,13 @@ def save_cache_head(head: nn.Module, config: CacheHeadConfig, path: str | Path) 
     """Save head weights plus schedule, head architecture, and CFG scale."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_version = 3 if config.head_variant != "legacy" else config.version
-    if checkpoint_version not in (1, 2, 3):
+    if config.head_variant == SPARSE_DIT_VARIANT:
+        checkpoint_version = 4
+    elif config.head_variant != "legacy":
+        checkpoint_version = 3
+    else:
+        checkpoint_version = config.version
+    if checkpoint_version not in (1, 2, 3, 4):
         raise ValueError(f"Unsupported CacheHead checkpoint version: {checkpoint_version}")
     stored_config = config if config.version == checkpoint_version else CacheHeadConfig(
         **{**_deep_asdict(config), "schedule": config.schedule, "version": checkpoint_version}
@@ -500,6 +560,58 @@ def save_cache_head(head: nn.Module, config: CacheHeadConfig, path: str | Path) 
     }
     torch.save(payload, path)
     return path
+
+
+def peek_head_variant(path: str | Path) -> str:
+    """Read just ``config.head_variant`` from a checkpoint.
+
+    Used to pick a loader before committing to one.  ``mmap=True`` keeps the
+    tensors on disk, which matters because a ``sparse_dit`` checkpoint holds the
+    whole ~1.3B-parameter student and reading it twice would be gratuitous.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"CacheHead checkpoint not found: {path}")
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except Exception:
+        # Older torch, or a checkpoint not written in the zipfile format.
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    return dict(payload.get("config", {})).get("head_variant", "legacy")
+
+
+def read_cache_head_checkpoint(path: str | Path) -> tuple[CacheHeadConfig, dict]:
+    """Parse a checkpoint into ``(config, state_dict)`` without building a model.
+
+    Shared by :func:`load_cache_head` and ``sparse_cache_head.load_sparse_cache_head``:
+    the ``sparse_dit`` variant cannot be reconstructed here because rebuilding it
+    needs the teacher DiT, but the config migration logic is identical.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"CacheHead checkpoint not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint_version = payload.get("version")
+    if checkpoint_version not in (1, 2, 3, 4):
+        raise ValueError(f"Unsupported CacheHead checkpoint version: {payload.get('version')}")
+    cfg = dict(payload["config"])
+    # Version-1 checkpoints were trained and deployed with an external /10 in
+    # head_step().  Move that behavior into the self-describing config so the
+    # new direct-add call sites preserve old checkpoints exactly.
+    if checkpoint_version == 1:
+        cfg.setdefault("residual_scale", 0.1)
+    if checkpoint_version in (1, 2):
+        cfg.setdefault("head_variant", "legacy")
+    elif "head_variant" not in cfg:
+        raise ValueError(
+            f"Version-{checkpoint_version} CacheHead checkpoint is missing config.head_variant"
+        )
+    cfg["version"] = checkpoint_version
+    schedule = CacheHeadSchedule(**cfg["schedule"])
+    config = CacheHeadConfig(
+        schedule=schedule, **{k: v for k, v in cfg.items() if k != "schedule"}
+    )
+    return config, payload["model_state_dict"]
 
 
 def load_cache_head(
@@ -516,30 +628,15 @@ def load_cache_head(
     and the next full step hands float32 activations to a bf16 Wan.  Pass the
     pipeline dtype to keep the two in step.
     """
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(f"CacheHead checkpoint not found: {path}")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    checkpoint_version = payload.get("version")
-    if checkpoint_version not in (1, 2, 3):
-        raise ValueError(f"Unsupported CacheHead checkpoint version: {payload.get('version')}")
-    cfg = dict(payload["config"])
-    # Version-1 checkpoints were trained and deployed with an external /10 in
-    # head_step().  Move that behavior into the self-describing config so the
-    # new direct-add call sites preserve old checkpoints exactly.
-    if checkpoint_version == 1:
-        cfg.setdefault("residual_scale", 0.1)
-    if checkpoint_version in (1, 2):
-        cfg.setdefault("head_variant", "legacy")
-    elif "head_variant" not in cfg:
-        raise ValueError("Version-3 CacheHead checkpoint is missing config.head_variant")
-    cfg["version"] = checkpoint_version
-    schedule = CacheHeadSchedule(**cfg["schedule"])
-    config = CacheHeadConfig(
-        schedule=schedule, **{k: v for k, v in cfg.items() if k != "schedule"}
-    )
+    config, state_dict = read_cache_head_checkpoint(path)
+    if config.head_variant == SPARSE_DIT_VARIANT:
+        raise ValueError(
+            "this is a 'sparse_dit' checkpoint; rebuild it with "
+            "sparse_cache_head.load_sparse_cache_head(path, teacher_dit=...) -- it needs "
+            "the teacher DiT to reconstruct the inherited blocks"
+        )
     head = CacheHead(config)
-    head.load_state_dict(payload["model_state_dict"])
+    head.load_state_dict(state_dict)
     head.to(device=device) if dtype is None else head.to(device=device, dtype=dtype)
     head.eval()
     return head, config

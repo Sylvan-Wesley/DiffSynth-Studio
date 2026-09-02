@@ -142,21 +142,28 @@ def _batch(trainer, n, seed=0):
 # ═══════════════════════════════════════════════════════════════
 
 def test_flow_to_x0_matches_formula():
+    torch.manual_seed(0)
     latents = torch.randn(2, 3, 4, 5)
     flow = torch.randn(2, 3, 4, 5)
     sigma = torch.tensor([0.3, 0.7])
     got = flow_to_x0(latents, flow, sigma)
     expected = latents - sigma.view(-1, 1, 1, 1) * flow
-    assert torch.allclose(got, expected)
+    # The helper accumulates in float64 and casts back, so it disagrees with a
+    # pure-float32 formula by ~1e-7 -- above allclose's default atol of 1e-8
+    # wherever an element lands near zero.
+    assert torch.allclose(got, expected, atol=1e-6)
 
 
 def test_forward_diffuse_matches_formula():
+    torch.manual_seed(0)
     x0 = torch.randn(2, 3, 4, 5)
     eps = torch.randn(2, 3, 4, 5)
     sigma = torch.tensor([0.3, 0.7])
     got = forward_diffuse(x0, eps, sigma)
     expected = (1 - sigma.view(-1, 1, 1, 1)) * x0 + sigma.view(-1, 1, 1, 1) * eps
-    assert torch.allclose(got, expected)
+    # See test_flow_to_x0_matches_formula: float64 accumulation vs a float32
+    # reference needs a tolerance above the default atol.
+    assert torch.allclose(got, expected, atol=1e-6)
 
 
 def test_flow_to_x0_scalar_sigma():

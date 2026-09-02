@@ -16,7 +16,7 @@ from cache_head_model import (
     CacheHead,
     CacheHeadConfig,
     CacheHeadSchedule,
-    HEAD_VARIANTS,
+    TOKEN_HEAD_VARIANTS,
     load_cache_head,
     patchify_latents,
     parse_full_step_indices,
@@ -250,7 +250,7 @@ def test_checkpoint_round_trip():
     )
 
 
-@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+@pytest.mark.parametrize("variant", TOKEN_HEAD_VARIANTS[1:])
 def test_version_three_variant_checkpoint_round_trip(tmp_path, variant):
     cfg = CacheHeadConfig(head_variant=variant, version=3)
     head = CacheHead(cfg, zero_init_out_proj=False).eval()
@@ -325,7 +325,7 @@ def test_head_accepts_a_float32_timestep_in_a_bf16_model():
     assert torch.isfinite(out.float()).all()
 
 
-@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+@pytest.mark.parametrize("variant", TOKEN_HEAD_VARIANTS[1:])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_latent_variants_forward_backward_in_every_precision(variant, dtype):
     cfg = CacheHeadConfig(head_variant=variant, version=3)
@@ -343,7 +343,7 @@ def test_latent_variants_forward_backward_in_every_precision(variant, dtype):
     assert all(p.grad is not None for p in head.parameters())
 
 
-@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+@pytest.mark.parametrize("variant", TOKEN_HEAD_VARIANTS[1:])
 def test_latent_variants_require_exact_latent_token_shape(variant):
     head = CacheHead(CacheHeadConfig(head_variant=variant, version=3))
     tokens = torch.randn(1, 24, 64)
@@ -353,7 +353,7 @@ def test_latent_variants_require_exact_latent_token_shape(variant):
         head(tokens, torch.tensor([500.0]), (2, 3, 4), torch.randn(1, 23, 64))
 
 
-@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+@pytest.mark.parametrize("variant", TOKEN_HEAD_VARIANTS[1:])
 def test_zero_init_latent_variants_are_exact_carry(variant):
     head = CacheHead(CacheHeadConfig(head_variant=variant, version=3))
     tokens = torch.randn(1, 24, 64)

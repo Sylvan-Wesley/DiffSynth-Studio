@@ -86,7 +86,7 @@ def collect_step_errors(
         if prev_guided is not None:
             head_noise, head_tokens = head_step(
                 head, t, prev_guided, grid, patch_size,
-                current_latents=latents,
+                current_latents=latents, context=ctx,
             )
             diff = (head_tokens - teacher_tokens).float()          # [B, S, C]
             err = diff.norm(dim=-1)                                # [B, S]

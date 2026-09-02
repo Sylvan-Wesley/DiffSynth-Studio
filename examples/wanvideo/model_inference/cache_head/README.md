@@ -27,10 +27,97 @@ MotionCache, token selection, or selector training is used.
 | `download_mixkit_captions.py` | Downloads the upstream Open-Sora-Plan annotation JSON and extracts its 8,230 current MixKit captions into training JSONL |
 | `cache_head_model_inference.py` | Hybrid inference runner (`hybrid` / `full` / `carry` modes), 16-state trajectory capture |
 | `cache_head_model_training.py` | Training harness + loss study: `carry_previous`, `residual_regression`, `supervised`, `dmd`, `dmd_plus_reg` |
+| `sparse_attention.py` | Pluggable sparse self-attention: drop-in replacement for Wan's parameter-free `AttentionModule`, plus the pattern registry and block-mask cache |
+| `sparse_cache_head.py` | `SparseCacheHead` — the teacher-inherited DiT student — and its conv3d latent-fusion adapter, depth selection, and checkpoint I/O |
+| `profile_block_importance.py` | Ranks teacher DiT blocks by residual-stream contribution, to choose which blocks a shallower student keeps |
 | `cache_head_error_heatmap.py` | Per-patch head-vs-teacher error heat maps over a full trajectory (panel grid + per-step summary curve), plus the decoded video of that same rollout |
 | `pca_trajectory_eval.py` | Shared-PCA trajectory-difference artifacts (npz / png / metrics json) |
 | `cache_head_harness.py` | Agent harness loop: tamper-evident ledger, locked manifest, 7-invariant verify, runner, evaluate, review |
 | `tests/` | CPU-runnable tests (no GPU or Wan weights needed) |
+
+## The `sparse_dit` head variant
+
+`--head-variant sparse_dit` replaces the lightweight token-space head with a
+*structural clone of the teacher*: the same Wan DiT, with every self-attention
+swapped for a sparse one, fed by a conv3d that fuses the previous guided
+velocity into the current latent.
+
+```
+prev_guided [B,S,64] --unpatchify--> [B,16,f,h,w] --.
+                                                    |--concat--> conv3d --+--> DiT --> v_hat [B,S,64]
+current latent x_k   ----------------------------- '                      |
+                                                     current latent ------'  (residual)
+```
+
+- **Weights are inherited**, not retrained from scratch. Wan's `AttentionModule`
+  owns no parameters, so swapping it leaves `state_dict()` byte-identical.
+- **The conv's last layer is zero-initialized**, so at step 0 the fused input is
+  exactly `x_k`, the DiT sees precisely its native input distribution, and no
+  warm-up phase is needed. With `--sparse-pattern dense` the student then
+  reproduces a positive-context teacher forward *bit-for-bit* (pinned by
+  `test_dense_student_reproduces_the_teacher_exactly`).
+- **A head step is a single forward with positive context only.** The student
+  predicts the CFG-guided velocity outright; classifier-free guidance is
+  distilled into its weights. There is no residual add onto `prev_guided` —
+  the previous prediction reaches the model only through the conv fusion.
+  Early loss is therefore large by construction; `carry_mse` and
+  `relative_improvement` are the meaningful references, not the absolute value.
+- **Everything trains**: the full DiT plus the adapter (~1.3B parameters,
+  roughly 10 GB/rank of params + grads + AdamW state in bf16). Activation
+  checkpointing is on by default and is effectively required at S=32,760.
+
+### Cost, and why depth matters
+
+Per block at S=32,760 (grid 21x30x52, dim 1536, ffn 8960):
+
+| component | MACs | share |
+|---|---|---|
+| self-attn scores | 3.30e12 | 70% |
+| self-attn projections | 0.31e12 | 7% |
+| cross-attn | 0.20e12 | 4% |
+| FFN | 0.90e12 | 19% |
+
+A 5x5 spatial window over 5 frames is 125 of 32,760 keys (0.38% density),
+collapsing the 70% term to almost nothing — after which the **FFN dominates at
+~63%** and depth becomes the main remaining lever. Hence `--student-num-layers`
+(uniform stride retaining the first and last block) and
+`--student-layer-indices` (explicit, chosen from `profile_block_importance.py`).
+
+```bash
+# 1. measure which blocks actually move the residual stream
+python profile_block_importance.py --captions mixkit_captions.jsonl --keep 15
+
+# 2. sanity check: dense + full depth must match the teacher
+python cache_head_model_training.py --arm supervised --head-variant sparse_dit \
+    --sparse-pattern dense --captions mixkit_captions.jsonl --subset 2 --epochs 1 \
+    --micro-batch 1 --batch-size 1
+
+# 3. the real run
+python cache_head_model_training.py --arm supervised --head-variant sparse_dit \
+    --sparse-pattern spatiotemporal_window --sparse-spatial-radius 2 \
+    --sparse-temporal-radius 2 --student-layer-indices 0,2,4,... \
+    --captions mixkit_captions.jsonl --prefetch-and-offload
+```
+
+`--prefetch-and-offload` warms the teacher-trajectory and prompt-embedding
+caches for the whole split, then moves the teacher DiT (~2.6 GB) and umT5-XXL
+(~11 GB) to CPU — neither is needed once both caches are warm, and that memory
+is better spent on the student's activations.
+
+Notes and caveats:
+
+- Prompt embeddings get their own cache (`<trajectory-dir>/contexts/`) keyed by
+  caption alone, since they do not depend on the schedule, seed, or cfg scale.
+- `sparse_dit` currently requires `--arm supervised`; the DMD arms roll the
+  student forward through `head_step` and have not been validated at full size.
+- Checkpoints grow from ~300 KB to ~2.6 GB, so pick `--checkpoint-every`
+  accordingly.
+- Set `CACHEHEAD_COMPILE_FLEX=0` to run `flex_attention` eagerly while
+  debugging; it is compiled by default because eager flex_attention
+  materializes the score matrix.
+- Training is teacher-forced on the *teacher's* `x_k`, while inference sees the
+  drifted live hybrid latent — the same train/test gap the latent-conditioned
+  variants have.
 
 ## Key design facts
 
