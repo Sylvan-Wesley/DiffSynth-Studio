@@ -92,6 +92,16 @@ def _ctx(seed, B=1, L=5, D=8):
     return torch.randn(B, L, D)
 
 
+def test_head_step_adds_the_configured_residual_without_external_division():
+    class OnesHead(torch.nn.Module):
+        def forward(self, tokens, timestep, grid):
+            return torch.ones_like(tokens)
+
+    previous = torch.zeros(1, GRID[0] * GRID[1] * GRID[2], TOK_C)
+    _, velocity = head_step(OnesHead(), torch.tensor([500.0]), previous, GRID, PATCH_SIZE)
+    assert torch.equal(velocity, torch.ones_like(velocity))
+
+
 def test_hybrid_schedule_call_counts():
     dit, scheduler = _make_dit_scheduler()
     head = SpyHead(CacheHeadConfig())
@@ -140,7 +150,7 @@ def test_prev_guided_propagation():
             assert torch.equal(seen_input, expected_prev), f"head step {progress_id} saw wrong tokens"
             assert seen_t == pytest.approx(float(scheduler.timesteps[progress_id].item()))
             # Expected prev for the next head step = v_tokens = input + residual.
-            residual = head(seen_input, torch.tensor([seen_t]), GRID) / 10.0
+            residual = head(seen_input, torch.tensor([seen_t]), GRID)
             expected_prev = seen_input + residual
     assert seen_idx == 10
 

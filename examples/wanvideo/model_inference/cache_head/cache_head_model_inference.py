@@ -2,7 +2,7 @@
 Hybrid Wan + CacheHead inference runner.
 
 Runs the 15-step schedule with the full Wan model (positive/negative CFG) only
-at the anchor steps and the lightweight CacheHead at the other ten steps:
+at the anchor steps and the lightweight CacheHead at the remaining steps:
 
     full step:  run full Wan CFG, refresh prev_guided_noise_tokens
     head step:  v_tokens = prev_guided_noise_tokens
@@ -73,7 +73,7 @@ def head_step(head, timestep, prev_guided_tokens, grid, patch_size):
 
     Returns (noise_pred [B,C,F,H,W], v_tokens [B,S,64]).
     """
-    residual = head(prev_guided_tokens, timestep, grid) / 10.0
+    residual = head(prev_guided_tokens, timestep, grid)
     v_tokens = prev_guided_tokens + residual
     noise_pred = unpatchify_tokens(v_tokens, grid, patch_size)
     return noise_pred, v_tokens

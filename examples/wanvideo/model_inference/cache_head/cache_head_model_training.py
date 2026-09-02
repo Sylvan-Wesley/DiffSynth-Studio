@@ -1,13 +1,13 @@
 """
 CacheHead training harness + loss study.
 
-For each training sample the harness
-  1. samples noise, a prompt, and one of the ten head-step indices,
-  2. rolls the scheduled prefix under ``no_grad`` to the hybrid latent ``x_i``,
-  3. runs the chosen CacheHead update with gradients to produce ``x_{i+1}``,
-  4. queries frozen full Wan at the same hybrid state (never an all-full
-     reference trajectory),
-  5. updates CacheHead only.
+The supervised arm samples a fixed full-Wan teacher trajectory, persists all
+15 guided CFG token predictions, and trains only on the schedule complement.
+At student step ``k``, teacher tokens from ``k-1`` are the input and teacher
+tokens from ``k`` are the MSE target.  The teacher velocity advances every
+denoising step, so student predictions never alter the training trajectory.
+Each data iteration repeats this all-student-step update a configurable number
+of times (five by default).
 
 Arms:
     carry_previous       no learned head
@@ -15,9 +15,9 @@ Arms:
     dmd                  Strict DMD after a shared regression warm-up
     dmd_plus_reg         DMD + regression (sweep ``--reg-weight`` 0.03/0.1/0.3)
 
-Strict DMD uses a training-only LoRA-Wan fake-score estimator
+The legacy DMD arms use a training-only LoRA-Wan fake-score estimator
 (``fake_score_wan.py``) on top of frozen Wan's score prediction; one CacheHead
-update alternates with four fake-score updates.  The fake-score is discarded
+update alternates with five fake-score updates.  The fake-score is discarded
 after training; only CacheHead weights + config are exported.
 
 Loss conventions follow ``diffsynth/diffusion/dmd2.py``:
@@ -29,6 +29,7 @@ Loss conventions follow ``diffsynth/diffusion/dmd2.py``:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime
 import hashlib
 import json
@@ -226,7 +227,9 @@ class CacheHeadTrainer:
         warmup_steps: int = 2000,
         updates: int = 10000,
         epochs: int = 1,
-        chain_run_grads: bool = False,
+        optimizer_steps_per_iteration: int = 5,
+        trajectory_dir: str | Path | None = None,
+        trajectory_seed: int | None = None,
         text_encode_batch: Callable[[list[str]], torch.Tensor] | None = None,
         val_dataset: PromptDataset | None = None,
         val_batches: int = 8,
@@ -248,6 +251,11 @@ class CacheHeadTrainer:
             )
         if arm in DMD_ARMS and fake_score is None:
             raise ValueError(f"arm {arm!r} needs a fake-score estimator, got fake_score=None")
+        if optimizer_steps_per_iteration < 1:
+            raise ValueError(
+                "optimizer_steps_per_iteration must be positive, got "
+                f"{optimizer_steps_per_iteration}"
+            )
         self.dit = dit
         self.scheduler = scheduler
         self.head = head
@@ -269,7 +277,9 @@ class CacheHeadTrainer:
         self.warmup_steps = warmup_steps
         self.updates = updates
         self.epochs = epochs
-        self.chain_run_grads = chain_run_grads
+        self.optimizer_steps_per_iteration = optimizer_steps_per_iteration
+        self.trajectory_dir = Path(trajectory_dir) if trajectory_dir else None
+        self.trajectory_seed = seed if trajectory_seed is None else trajectory_seed
         self.val_dataset = val_dataset
         self.val_batches = val_batches
         self.device = device
@@ -309,6 +319,9 @@ class CacheHeadTrainer:
         self.logs: list[dict] = []
         # Plain-text mirror of the progress lines; ``train`` fills it in.
         self.log_path: Path | None = None
+        self._trajectory_fingerprint_value: str | None = None
+        self.trajectory_cache_hits = 0
+        self.trajectory_cache_misses = 0
 
     # ---- sampling --------------------------------------------------------
 
@@ -382,16 +395,13 @@ class CacheHeadTrainer:
         """CacheHead update at step j WITH gradients.  Returns
         (v_tokens, noise_pred, x0_G, t_j, sigma_j, head_out).
 
-        ``head_out`` is the head's raw, undivided output: it is trained to
-        predict 100x the true (small) residual, so callers that build a loss
-        directly from it -- rather than from the /100-corrected ``v_tokens``
-        -- get an undiluted gradient into the head instead of one attenuated
-        by the same /100 that keeps ``v_tokens`` physically small.
+        ``head_out`` is the residual used directly by current checkpoints.
+        Legacy checkpoint scaling is encapsulated by ``CacheHeadConfig``.
         """
         t_j = self._t(step_j)
         sigma_j = self._sigma(step_j)
         head_out = self.head(prev_guided, t_j, self.grid)
-        v_tokens = prev_guided + head_out / 10.0
+        v_tokens = prev_guided + head_out
         noise_pred = unpatchify_tokens(v_tokens, self.grid, self.patch)
         x0_G = flow_to_x0(latents, noise_pred, sigma_j)
         return v_tokens, noise_pred, x0_G, t_j, sigma_j, head_out
@@ -421,12 +431,7 @@ class CacheHeadTrainer:
         )
         with torch.no_grad():
             _, teacher_tokens = full_step(self.dit, latents, t_j, sample["ctx"], self.neg_ctx, self.cfg)
-        # Undiluted gradient: compare the head's raw output directly to the
-        # residual at its native (100x) scale, instead of through the
-        # /100-corrected v_tokens (see _head_step_grad).
-        scaled_v = prev_guided * 10.0 + head_out
-        scaled_teacher = teacher_tokens * 10.0
-        loss = regression_loss(scaled_v, scaled_teacher, self.reg_loss)
+        loss = regression_loss(v_tokens, teacher_tokens, self.reg_loss)
         return {"loss": loss, "x0_G": x0_G, "v_tokens": v_tokens}
 
     def dmd(self, sample: dict) -> dict:
@@ -447,95 +452,221 @@ class CacheHeadTrainer:
         if self.arm == "dmd_plus_reg":
             with torch.no_grad():
                 _, teacher_tokens = full_step(self.dit, latents, t_j, sample["ctx"], self.neg_ctx, self.cfg)
-            scaled_v = prev_guided * 10.0 + head_out
-            scaled_teacher = teacher_tokens * 10.0
-            reg = regression_loss(scaled_v, scaled_teacher, self.reg_loss)
+            reg = regression_loss(v_tokens, teacher_tokens, self.reg_loss)
             loss = loss + self.reg_weight * reg
         return {"loss": loss, "x0_G": x0_G, "v_tokens": v_tokens}
 
-    def supervised_trajectory(self, batch: dict) -> dict:
-        """Roll one batched hybrid trajectory, supervising every head step.
+    @torch.no_grad()
+    def teacher_guided_trajectory(self, batch: dict) -> torch.Tensor:
+        """Sample a full-Wan trajectory and return guided tokens ``[B,T,S,C]``.
 
-        At each head step the head predicts ``v_hat = v_prev + r(v_prev, t)``
-        and frozen Wan is queried at the *same* hybrid state to produce the
-        target.  Unlike ``regression``, which spends a whole prefix rollout to
-        supervise a single sampled step, this supervises all ten head steps of
-        one rollout, so one trajectory yields ``10 * B`` targets.
-
-        The loss lives entirely in noise-token space ``[B, N, C]``; the
-        unpatchified ``[B, C, F, H, W]`` latent is used only to advance the
-        scheduler and never enters the loss.
+        Every scheduler update uses the teacher's latent velocity.  The saved
+        guided tokens are consequently fixed teacher-forcing inputs/targets;
+        the student never changes this trajectory.
         """
         latents, ctx = batch["z"], batch["ctx"]
         n_batch = latents.shape[0]
         neg_ctx = self._neg_ctx_for(n_batch)
-        expected_tokens = (n_batch, self.grid[0] * self.grid[1] * self.grid[2])
-
-        prev_guided = None
-        total = None
-        per_step: list[dict] = []
-
+        guided_steps = []
         for k in range(self.schedule.num_inference_steps):
             t = self._t(k)
-            if self.schedule.is_full_step(k):
-                with torch.no_grad():
-                    noise_pred, prev_guided = full_step(
-                        self.dit, latents, t, ctx, neg_ctx, self.cfg
-                    )
-            else:
-                if prev_guided is None:
-                    raise RuntimeError(
-                        f"head step at progress {k} before any full step; "
-                        f"invalid schedule {self.schedule}"
-                    )
-                head_out = self.head(prev_guided, t, self.grid)
-                v_tokens = prev_guided + head_out / 10.0
-                with torch.no_grad():
-                    _, teacher_tokens = full_step(
-                        self.dit, latents, t, ctx, neg_ctx, self.cfg
-                    )
-                # Guard the [B, N, C] contract: full_step also returns a
-                # latent-shaped tensor, and pairing the wrong one here is the
-                # easiest way to silently move the loss out of token space.
-                if v_tokens.shape != teacher_tokens.shape or v_tokens.shape[:2] != expected_tokens:
-                    raise RuntimeError(
-                        f"supervised loss expects [B, N, C] noise tokens "
-                        f"{expected_tokens + (WAN_NOISE_TOKEN_CHANNELS,)}, got "
-                        f"head {tuple(v_tokens.shape)} vs teacher {tuple(teacher_tokens.shape)}"
-                    )
-                # Loss is built from head_out directly (undivided) against the
-                # residual at its native 100x scale, not from the physically
-                # small v_tokens/teacher_tokens gap: the /100 above keeps
-                # v_tokens correct for unpatchify_tokens + the scheduler step
-                # below, but reusing it in the loss would dilute the gradient
-                # into head_out by another 100x on top of the residual
-                # already being small (the reason for this scaling).
-                # Accumulate in float32: under --precision bf16 the loss comes
-                # back as bf16 (~3 decimal digits), and summing ten of them then
-                # dividing throws away precision in both the logged value and
-                # the gradient.  Autograd carries the cast back through.
-                teacher_tokens_norm = teacher_tokens.abs().sum(dim=-1, keepdim=True).detach() + 1e-6
-                scaled_v_tokens = v_tokens / teacher_tokens_norm
-                scaled_teacher = teacher_tokens / teacher_tokens_norm
-                step_loss = regression_loss(scaled_v_tokens, scaled_teacher, self.reg_loss).float()
-                total = step_loss if total is None else total + step_loss
-                per_step.append({"step": k, "loss": float(step_loss.detach().item())})
-                noise_pred = unpatchify_tokens(v_tokens, self.grid, self.patch)
-                # Detach between head steps unless the run is explicitly
-                # chained: the head feeds itself across consecutive head steps,
-                # and keeping that graph is a deliberate (costlier) choice.
-                prev_guided = v_tokens if self.chain_run_grads else v_tokens.detach()
+            noise_pred, guided = full_step(self.dit, latents, t, ctx, neg_ctx, self.cfg)
+            guided_steps.append(guided.detach())
+            latents = self.scheduler.step(noise_pred, t, latents)
+        return torch.stack(guided_steps, dim=1)
 
-            # The trajectory itself never carries gradient; only each head
-            # step's own prediction does.  Without this the graph would span
-            # all fifteen steps.
-            with torch.no_grad():
-                latents = self.scheduler.step(noise_pred.detach(), t, latents)
+    def supervised_teacher_forced(self, teacher_guided: torch.Tensor) -> dict:
+        """MSE between student and teacher velocities on student steps only.
+
+        ``teacher_guided[:, k-1]`` is the student's carry at step ``k`` and
+        ``teacher_guided[:, k]`` is its target.  Both are from the fixed full
+        teacher rollout, so no student prediction is fed into a later step.
+        """
+        n_batch = teacher_guided.shape[0]
+        expected = (
+            n_batch,
+            self.schedule.num_inference_steps,
+            self.grid[0] * self.grid[1] * self.grid[2],
+            WAN_NOISE_TOKEN_CHANNELS,
+        )
+        if tuple(teacher_guided.shape) != expected:
+            raise RuntimeError(
+                f"teacher-guided trajectory must have shape {expected}, got "
+                f"{tuple(teacher_guided.shape)}"
+            )
+        total = None
+        per_step: list[dict] = []
+        for k in range(self.schedule.num_inference_steps):
+            if self.schedule.is_full_step(k):
+                continue
+            if k == 0:
+                raise RuntimeError("step 1 must be a dense/full-teacher step")
+            previous_teacher = teacher_guided[:, k - 1].detach()
+            teacher_target = teacher_guided[:, k].detach()
+            student = previous_teacher + self.head(previous_teacher, self._t(k), self.grid)
+            step_loss = F.mse_loss(student.float(), teacher_target.float())
+            total = step_loss if total is None else total + step_loss
+            per_step.append({"step": k + 1, "loss": float(step_loss.detach().item())})
 
         if total is None:
             raise RuntimeError(f"schedule {self.schedule} has no head steps to supervise")
         loss = total / self.schedule.num_head_steps
         return {"loss": loss, "per_step": per_step}
+
+    def supervised_trajectory(self, batch: dict) -> dict:
+        """Build an in-memory full-teacher trajectory, then train from it."""
+        teacher_guided = self.teacher_guided_trajectory(batch)
+        return self.supervised_teacher_forced(teacher_guided)
+
+    # ---- persistent full-teacher trajectory cache ----------------------
+
+    def _trajectory_fingerprint(self) -> str:
+        if self._trajectory_fingerprint_value is not None:
+            return self._trajectory_fingerprint_value
+        negative_hash = hashlib.sha256(
+            self.neg_ctx.detach().float().cpu().contiguous().numpy().tobytes()
+        ).hexdigest()
+        spec = {
+            "schema": 1,
+            "model_id": getattr(
+                self.dit, "_cache_head_model_id", "Wan-AI/Wan2.1-T2V-1.3B"
+            ),
+            "num_inference_steps": self.schedule.num_inference_steps,
+            "cfg_scale": self.cfg,
+            "patch_size": tuple(self.patch),
+            "grid": self.grid,
+            "latent_shape": self.latent_shape,
+            "dtype": str(self.dtype),
+            "trajectory_seed": self.trajectory_seed,
+            "negative_context_sha256": negative_hash,
+            "timesteps": [float(v) for v in self.scheduler.timesteps.detach().cpu()],
+            "sigmas": [float(v) for v in self.scheduler.sigmas.detach().cpu()],
+        }
+        encoded = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self._trajectory_fingerprint_value = hashlib.sha256(encoded).hexdigest()
+        return self._trajectory_fingerprint_value
+
+    @staticmethod
+    def _caption_hash(caption: str) -> str:
+        return hashlib.sha256(caption.encode("utf-8")).hexdigest()
+
+    def _trajectory_path(self, split: str, caption_id: str, caption: str) -> Path:
+        if self.trajectory_dir is None:
+            raise RuntimeError("trajectory_dir must be configured before supervised training")
+        sample_key = hashlib.sha256(
+            f"{caption_id}\0{self._caption_hash(caption)}".encode("utf-8")
+        ).hexdigest()
+        return self.trajectory_dir / self._trajectory_fingerprint() / split / f"{sample_key}.pt"
+
+    def _sample_seed(self, split: str, caption_id: str) -> int:
+        digest = hashlib.sha256(
+            f"{self.trajectory_seed}\0{split}\0{caption_id}".encode("utf-8")
+        ).digest()
+        return int.from_bytes(digest[:8], "big") % (2**63 - 1)
+
+    def _load_teacher_trajectory(
+        self, path: Path, *, split: str, caption_id: str, caption: str
+    ) -> torch.Tensor:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            raise RuntimeError(f"could not load teacher trajectory cache {path}: {exc}") from exc
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        expected_metadata = {
+            "schema": 1,
+            "fingerprint": self._trajectory_fingerprint(),
+            "split": split,
+            "caption_id": str(caption_id),
+            "caption_sha256": self._caption_hash(caption),
+            "sample_seed": self._sample_seed(split, str(caption_id)),
+        }
+        if any(metadata.get(key) != value for key, value in expected_metadata.items()):
+            raise RuntimeError(
+                f"teacher trajectory metadata mismatch for {path}; remove that cache file "
+                "or use a different --trajectory-dir"
+            )
+        tokens = payload.get("guided_tokens")
+        expected_shape = (
+            self.schedule.num_inference_steps,
+            self.grid[0] * self.grid[1] * self.grid[2],
+            WAN_NOISE_TOKEN_CHANNELS,
+        )
+        if not isinstance(tokens, torch.Tensor) or tuple(tokens.shape) != expected_shape:
+            actual = None if not isinstance(tokens, torch.Tensor) else tuple(tokens.shape)
+            raise RuntimeError(
+                f"teacher trajectory {path} has guided_tokens shape {actual}; "
+                f"expected {expected_shape}"
+            )
+        if not torch.isfinite(tokens.float()).all():
+            raise RuntimeError(f"teacher trajectory {path} contains NaN or Inf")
+        return tokens.contiguous()
+
+    def _save_teacher_trajectory(
+        self,
+        path: Path,
+        tokens: torch.Tensor,
+        *,
+        split: str,
+        caption_id: str,
+        caption: str,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "metadata": {
+                "schema": 1,
+                "fingerprint": self._trajectory_fingerprint(),
+                "split": split,
+                "caption_id": str(caption_id),
+                "caption_sha256": self._caption_hash(caption),
+                "sample_seed": self._sample_seed(split, str(caption_id)),
+            },
+            # The guided CFG velocity tokens are the complete training contract;
+            # latent states and text embeddings are intentionally not persisted.
+            "guided_tokens": tokens.detach().cpu().contiguous(),
+        }
+        temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{self.distributed.rank}")
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+
+    def load_teacher_batch(
+        self, items: list[tuple[str, str]], *, split: str
+    ) -> torch.Tensor:
+        """Load fixed trajectories, lazily generating all cache misses in one batch."""
+        paths = [self._trajectory_path(split, str(cid), caption) for cid, caption in items]
+        missing = [i for i, path in enumerate(paths) if not path.is_file()]
+        self.trajectory_cache_hits += len(items) - len(missing)
+        self.trajectory_cache_misses += len(missing)
+
+        if missing:
+            missing_items = [items[i] for i in missing]
+            captions = [caption for _, caption in missing_items]
+            latents = []
+            for caption_id, _ in missing_items:
+                generator = torch.Generator(device="cpu").manual_seed(
+                    self._sample_seed(split, str(caption_id))
+                )
+                latents.append(
+                    torch.randn(self.latent_shape[1:], generator=generator, dtype=torch.float32)
+                )
+            batch = {
+                "z": torch.stack(latents).to(device=self.device, dtype=self.dtype),
+                "ctx": self.encode_captions(captions),
+            }
+            guided = self.teacher_guided_trajectory(batch).detach().cpu()
+            for local_i, source_i in enumerate(missing):
+                caption_id, caption = items[source_i]
+                self._save_teacher_trajectory(
+                    paths[source_i], guided[local_i], split=split,
+                    caption_id=str(caption_id), caption=caption,
+                )
+
+        loaded = [
+            self._load_teacher_trajectory(
+                path, split=split, caption_id=str(caption_id), caption=caption
+            )
+            for path, (caption_id, caption) in zip(paths, items)
+        ]
+        return torch.stack(loaded, dim=0)
 
     def fake_score_update(self, sample: dict) -> torch.Tensor:
         """Denoising loss for the LoRA fake-score on a stop-grad generated sample."""
@@ -594,13 +725,14 @@ class CacheHeadTrainer:
                   f"(effective batch {micro * accum} per rank, peak {peak / 1024 ** 3:.1f} GiB)")
         return micro, accum
 
-    def _emit(self, line: str) -> None:
-        """Print a progress line and append it to the dated run log.
+    def _emit(self, line: str, *, print_line: bool = True) -> None:
+        """Append every progress line to disk and optionally print it.
 
         The file is reopened per line so a crashed or killed run still leaves
-        every line it had already reported on disk.
+        every optimizer update it had already completed on disk.
         """
-        print(line)
+        if print_line:
+            print(line)
         if self.log_path is not None:
             with open(self.log_path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
@@ -628,12 +760,20 @@ class CacheHeadTrainer:
                 f"training_type must be one of {TRAINING_TYPES}, got {training_type!r}"
             )
 
-        _, accum = self.memory_probe(training_type)
         save_dir = Path(save_dir) if save_dir else None
         if save_dir:
             if self.distributed.is_main_process:
                 save_dir.mkdir(parents=True, exist_ok=True)
             self.distributed.barrier()
+        if training_type == "supervised":
+            if self.trajectory_dir is None:
+                self.trajectory_dir = (
+                    save_dir / "trajectories" if save_dir else Path("cache_head_trajectories")
+                )
+            self.trajectory_dir.mkdir(parents=True, exist_ok=True)
+            self.distributed.barrier()
+
+        _, accum = self.memory_probe(training_type)
 
         self.logs = []
         self.log_path = Path(log_path) if log_path else None
@@ -673,11 +813,14 @@ class CacheHeadTrainer:
         overall = 0.0
         n_batches = min(self.val_batches, max(1, len(self.val_dataset) // self.micro_batch))
         for _ in range(n_batches):
-            captions = [
-                self.val_dataset[rng.randrange(len(self.val_dataset))][1]
+            items = [
+                self.val_dataset[rng.randrange(len(self.val_dataset))]
                 for _ in range(self.micro_batch)
             ]
-            out = self.supervised_trajectory(self.make_batch(captions))
+            teacher_guided = self.load_teacher_batch(items, split="val").to(
+                device=self.device, dtype=self.dtype
+            )
+            out = self.supervised_teacher_forced(teacher_guided)
             overall += float(out["loss"].detach().item())
             for rec in out["per_step"]:
                 totals[rec["step"]] = totals.get(rec["step"], 0.0) + rec["loss"]
@@ -695,15 +838,15 @@ class CacheHeadTrainer:
         log_interval: int, wandb_run: Any | None,
         heatmap_hook: Callable[[int, Path], Any] | None = None,
     ) -> None:
-        captions = [caption for _, caption in self.dataset]
+        items = list(self.dataset)
         per_step_batch = self.micro_batch * accum
         # Every rank must run the same number of optimizer steps: ranks hold
         # disjoint prompt shards that can differ in length, and a rank with an
         # extra step blocks forever in DDP's gradient all-reduce.
-        steps_per_epoch = self.distributed.min_int(len(captions) // per_step_batch)
+        steps_per_epoch = self.distributed.min_int(len(items) // per_step_batch)
         if steps_per_epoch < 1:
             raise ValueError(
-                f"rank {self.distributed.rank} has {len(captions)} prompts but needs at least "
+                f"rank {self.distributed.rank} has {len(items)} prompts but needs at least "
                 f"{per_step_batch} (--micro-batch x accumulation) for one optimizer step; "
                 f"raise --subset or lower --batch-size/--micro-batch"
             )
@@ -711,65 +854,87 @@ class CacheHeadTrainer:
         global_step = 0
         best_val = float("inf")
         for epoch in range(self.epochs):
-            order = list(captions)
+            order = list(items)
             random.Random(self.seed + epoch).shuffle(order)
             cursor = 0
-            for step_in_epoch in range(steps_per_epoch):
-                self.head_opt.zero_grad(set_to_none=True)
-                micro_losses = []
-                per_step_acc: dict[int, float] = {}
+            for iteration_in_epoch in range(steps_per_epoch):
+                cached_micro_batches = []
                 for micro_step in range(accum):
-                    with self.distributed.no_sync(self.head, enabled=micro_step < accum - 1):
-                        chunk = order[cursor:cursor + self.micro_batch]
-                        cursor += self.micro_batch
-                        out = self.supervised_trajectory(self.make_batch(chunk))
-                        (out["loss"] / accum).backward()
-                        micro_losses.append(float(out["loss"].detach().item()))
-                        for rec in out["per_step"]:
-                            per_step_acc[rec["step"]] = per_step_acc.get(rec["step"], 0.0) + rec["loss"]
-                grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
-                )
-                self.head_opt.step()
+                    chunk = order[cursor:cursor + self.micro_batch]
+                    cursor += self.micro_batch
+                    cached_micro_batches.append(
+                        self.load_teacher_batch(chunk, split="train")
+                    )
 
-                loss_value = sum(micro_losses) / len(micro_losses)
-                finite = self.distributed.all_true(bool(torch.isfinite(torch.tensor(loss_value)).item()))
-                if not finite:
-                    raise RuntimeError(f"non-finite loss at epoch {epoch} step {step_in_epoch}")
+                iteration = epoch * steps_per_epoch + iteration_in_epoch
+                for inner_step in range(self.optimizer_steps_per_iteration):
+                    self.head_opt.zero_grad(set_to_none=True)
+                    micro_losses = []
+                    per_step_acc: dict[int, float] = {}
+                    for micro_step, cached in enumerate(cached_micro_batches):
+                        with self.distributed.no_sync(
+                            self.head, enabled=micro_step < accum - 1
+                        ):
+                            teacher_guided = cached.to(device=self.device, dtype=self.dtype)
+                            out = self.supervised_teacher_forced(teacher_guided)
+                            (out["loss"] / accum).backward()
+                            micro_losses.append(float(out["loss"].detach().item()))
+                            for rec in out["per_step"]:
+                                per_step_acc[rec["step"]] = (
+                                    per_step_acc.get(rec["step"], 0.0) + rec["loss"]
+                                )
+                    grad_norm = float(
+                        torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
+                    )
+                    self.head_opt.step()
 
-                record = {
-                    "step": global_step,
-                    "epoch": epoch,
-                    "phase": self.arm,
-                    "loss": loss_value,
-                    "grad_norm": grad_norm,
-                    "fake_score_loss": float("nan"),
-                    "per_step": {k: v / accum for k, v in sorted(per_step_acc.items())},
-                    "finite": finite,
-                }
-                if self.distributed.is_main_process:
-                    self.logs.append(record)
-                    if global_step % log_interval == 0:
-                        self._emit(f"[epoch {epoch} {step_in_epoch}/{steps_per_epoch}] "
-                                   f"{record['phase']} loss={record['loss']:.4e} "
-                                   f"grad_norm={record['grad_norm']:.4e}")
+                    loss_value = sum(micro_losses) / len(micro_losses)
+                    finite = self.distributed.all_true(
+                        bool(torch.isfinite(torch.tensor(loss_value)).item())
+                    )
+                    if not finite:
+                        raise RuntimeError(
+                            f"non-finite loss at epoch {epoch} iteration "
+                            f"{iteration_in_epoch} inner step {inner_step}"
+                        )
+
+                    record = {
+                        "step": global_step,
+                        "iteration": iteration,
+                        "inner_step": inner_step,
+                        "epoch": epoch,
+                        "phase": self.arm,
+                        "loss": loss_value,
+                        "grad_norm": grad_norm,
+                        "fake_score_loss": float("nan"),
+                        "per_step": {k: v / accum for k, v in sorted(per_step_acc.items())},
+                        "finite": finite,
+                    }
+                    if self.distributed.is_main_process:
+                        self.logs.append(record)
+                        self._emit(
+                            f"[epoch {epoch} iteration {iteration_in_epoch}/{steps_per_epoch} "
+                            f"inner {inner_step + 1}/{self.optimizer_steps_per_iteration}] "
+                            f"{record['phase']} loss={record['loss']:.4e} "
+                            f"grad_norm={record['grad_norm']:.4e}",
+                            print_line=global_step % log_interval == 0,
+                        )
                         if wandb_run is not None:
-                            wandb_run.log(
-                                {"loss": record["loss"], "grad_norm": record["grad_norm"],
-                                 "epoch": epoch},
-                                step=global_step,
-                            )
+                            wandb_run.log(record, step=global_step)
 
-                if (save_dir and checkpoint_every > 0 and self.distributed.is_main_process
-                        and global_step > 0 and global_step % checkpoint_every == 0):
-                    self.save(save_dir / f"cache_head_step-{global_step}.ckpt")
-                global_step += 1
+                    if (save_dir and checkpoint_every > 0
+                            and self.distributed.is_main_process and global_step > 0
+                            and global_step % checkpoint_every == 0):
+                        self.save(save_dir / f"cache_head_step-{global_step}.ckpt")
+                    global_step += 1
 
             # --- end of epoch: validation, best checkpoint, heat map ---
             metrics = self.validate()
             if metrics:
-                self.logs.append({"step": global_step, "epoch": epoch, "phase": "val", **metrics})
                 if self.distributed.is_main_process:
+                    self.logs.append(
+                        {"step": global_step, "epoch": epoch, "phase": "val", **metrics}
+                    )
                     self._emit(f"[epoch {epoch}] val_loss={metrics['val_loss']:.4e}")
                     if wandb_run is not None:
                         wandb_run.log(
@@ -837,25 +1002,29 @@ class CacheHeadTrainer:
             }
             if self.distributed.is_main_process:
                 self.logs.append(record)
-                if global_step % log_interval == 0:
-                    self._emit(f"[{global_step}/{total}] {record['phase']} "
-                               f"loss={record['loss']:.4e} "
-                               f"grad_norm={record['grad_norm']:.4e} "
-                               f"fake={record['fake_score_loss']:.4e}")
-                    if wandb_run is not None:
-                        wandb_run.log(record, step=global_step)
+                self._emit(
+                    f"[{global_step}/{total}] {record['phase']} "
+                    f"loss={record['loss']:.4e} "
+                    f"grad_norm={record['grad_norm']:.4e} "
+                    f"fake={record['fake_score_loss']:.4e}",
+                    print_line=global_step % log_interval == 0,
+                )
+                if wandb_run is not None:
+                    wandb_run.log(record, step=global_step)
 
             if (save_dir and checkpoint_every > 0 and self.distributed.is_main_process and global_step > 0
                     and global_step % checkpoint_every == 0):
                 self.save(save_dir / f"cache_head_step-{global_step}.ckpt")
 
     def save(self, path: str | Path) -> Path:
-        cfg = CacheHeadConfig(
+        head = self.distributed.unwrap(self.head)
+        cfg = replace(
+            head.config,
             model_id=getattr(self.dit, "_cache_head_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
             schedule=self.schedule,
             cfg_scale=self.cfg,
         )
-        return save_cache_head(self.distributed.unwrap(self.head), cfg, path)
+        return save_cache_head(head, cfg, path)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -899,9 +1068,14 @@ def main() -> None:
                         help="supervised arm: prompts drawn from the held-out val split")
     parser.add_argument("--val-batches", type=int, default=8,
                         help="supervised arm: validation batches per epoch")
-    parser.add_argument("--chain-run-grads", action="store_true",
-                        help="supervised arm: backpropagate through consecutive head-step runs "
-                             "so within-run drift is penalized (costs ~3x head activations)")
+    parser.add_argument(
+        "--optimizer-steps-per-iteration", type=int, default=5,
+        help="supervised arm: optimizer updates over each fixed teacher batch (default: 5)",
+    )
+    parser.add_argument(
+        "--trajectory-dir", default=None,
+        help="persistent guided-token teacher cache (default: <save-dir>/trajectories)",
+    )
     parser.add_argument("--heatmap-every", type=int, default=0,
                         help="supervised arm: render a per-patch head-vs-teacher error heat map "
                              "every N epochs (0 disables)")
@@ -915,7 +1089,7 @@ def main() -> None:
     parser.add_argument(
         "--full-steps", type=parse_full_step_indices, default=None,
         help="1-indexed anchor (full-Wan / 'dense') step positions, comma-separated, "
-             "e.g. '1,2,6,10,14' (default: the schedule's built-in anchors)",
+             "e.g. '1,2,3,4,5,6,7' (default: the schedule's built-in anchors)",
     )
     parser.add_argument("--num-frames", type=int, default=81)
     parser.add_argument("--height", type=int, default=480)
@@ -931,7 +1105,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--log-interval", type=int, default=50,
-        help="print and, when enabled, send W&B metrics every N optimizer steps",
+        help="print every N optimizer steps; disk and W&B record every optimizer step",
     )
     parser.add_argument(
         "--log-dir", default="training_logs",
@@ -952,12 +1126,6 @@ def main() -> None:
         help="Weights & Biases mode when --wandb-project is set",
     )
     args = parser.parse_args()
-    # W&B in online mode is an outbound call like any other.  Offline mode is
-    # still usable (it writes a local run to sync later), so only the modes that
-    # actually need the network are turned off.
-    if args.no_network and args.wandb_project and args.wandb_mode != "offline":
-        print("[no-network] disabling W&B (pass --wandb-mode offline to keep local logging)")
-        args.wandb_project = None
     args.run_start_time = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S%z")
     if args.wandb_run_name:
         args.wandb_run_name = f"{args.wandb_run_name}-{args.run_start_time}"
@@ -972,6 +1140,8 @@ def main() -> None:
         )
     if args.epochs < 1:
         parser.error("--epochs must be positive")
+    if args.optimizer_steps_per_iteration < 1:
+        parser.error("--optimizer-steps-per-iteration must be positive")
     if args.heatmap_every < 0:
         parser.error("--heatmap-every must be non-negative")
     if args.log_interval <= 0:
@@ -1050,10 +1220,12 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         "杂乱的背景，三条腿，背景人很多，倒着走"
     )
 
-    schedule = CacheHeadSchedule(
-        num_inference_steps=args.num_steps,
-        full_step_indices=args.full_steps or (1, 2, 6, 10, 14),
-    )
+    schedule_kwargs = {"full_step_indices": args.full_steps} if args.full_steps else {}
+    schedule = CacheHeadSchedule(num_inference_steps=args.num_steps, **schedule_kwargs)
+    if args.arm == "supervised" and not schedule.is_full_step(0):
+        raise ValueError("supervised teacher forcing requires step 1 in --full-steps")
+    if args.arm == "supervised" and schedule.num_head_steps == 0:
+        raise ValueError("supervised teacher forcing requires at least one student step")
     config = CacheHeadConfig(model_id=args.model_id, schedule=schedule, cfg_scale=args.cfg)
     head = CacheHead(config).to(device=device, dtype=dtype)
     # FakeScoreWan deep-copies the whole DiT; only the DMD arms need it, and
@@ -1107,7 +1279,9 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         batch_size=args.batch_size, micro_batch=args.micro_batch,
         grad_clip=args.grad_clip,
         warmup_steps=args.warmup_steps, updates=args.updates,
-        epochs=args.epochs, chain_run_grads=args.chain_run_grads,
+        epochs=args.epochs,
+        optimizer_steps_per_iteration=args.optimizer_steps_per_iteration,
+        trajectory_dir=args.trajectory_dir, trajectory_seed=args.seed,
         text_encode_batch=text_encode_batch,
         val_dataset=val_dataset, val_batches=args.val_batches,
         device=device, dtype=dtype, seed=args.seed + distributed.rank,
@@ -1163,6 +1337,9 @@ def apply_no_network(args: argparse.Namespace) -> None:
     """
     if not args.no_network:
         return
+    if getattr(args, "wandb_project", None):
+        print("[no-network] disabling W&B")
+        args.wandb_project = None
     os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "true"
     if args.model_base_path:
         os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = args.model_base_path

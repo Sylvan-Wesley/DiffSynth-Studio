@@ -1,10 +1,11 @@
 # CacheHead: DMD-based Cache Distribution Matching for Wan2.1
 
-A 15-step Wan generator that keeps vanilla Wan frozen and replaces ten
+A 15-step Wan generator that keeps vanilla Wan frozen and replaces eight
 expensive denoising calls with a lightweight residual **CacheHead**.  The
-default 1-indexed full-Wan anchor steps are `[1, 2, 6, 10, 14]`; the other ten
-steps use CacheHead.  The schedule is configuration-only, so later experiments
-can move anchors without changing model code.
+default 1-indexed full-Wan anchor steps are `[1, 2, 3, 4, 5, 6, 7]`; steps
+`[8, 9, 10, 11, 12, 13, 14, 15]` use CacheHead.  The schedule is
+configuration-only, so later experiments can move anchors without changing
+model code.
 
 At a head step:
 
@@ -29,7 +30,7 @@ MotionCache, token selection, or selector training is used.
 | `cache_head_error_heatmap.py` | Per-patch head-vs-teacher error heat maps over a full trajectory (panel grid + per-step summary curve), plus the decoded video of that same rollout |
 | `pca_trajectory_eval.py` | Shared-PCA trajectory-difference artifacts (npz / png / metrics json) |
 | `cache_head_harness.py` | Agent harness loop: tamper-evident ledger, locked manifest, 7-invariant verify, runner, evaluate, review |
-| `tests/` | CPU-runnable tests (51 tests; no GPU or Wan weights needed) |
+| `tests/` | CPU-runnable tests (no GPU or Wan weights needed) |
 
 ## Key design facts
 
@@ -44,22 +45,25 @@ MotionCache, token selection, or selector training is used.
 - Training arms: 2,000 shared regression warm-up, then 10,000 CacheHead updates
   per arm; bf16, AdamW, effective batch 8, gradient clipping 1.0, startup memory
   probe for micro-batch / accumulation.  DMD alternates 1 CacheHead update with
-  4 fake-score updates.  Only CacheHead weights + config are exported.
+  5 fake-score updates.  Only CacheHead weights + config are exported.
 - The **`supervised`** arm runs a different loop from the DMD arms (the loop is
   derived from `--arm`, not a separate switch):
-  - One batched hybrid rollout supervises **every** head step against frozen Wan
-    queried at that same hybrid state, so a rollout yields `10 × B` targets
-    instead of one.  The loss lives in noise-token space `[B, N, C]`; the
-    unpatchified latent only advances the scheduler.
+  - A full frozen-Wan teacher supplies every scheduler update.  Its 15 guided
+    CFG token predictions are cached persistently, and student step `k` uses
+    teacher step `k-1` as input and teacher step `k` as its velocity target.
+  - Supervision is plain float32 MSE in noise-token space `[B, N, C]`, averaged
+    over the schedule complement (steps 8--15 by default).  The student never
+    changes the training trajectory.
+  - Each data iteration performs `--optimizer-steps-per-iteration` fresh
+    optimizer updates over the same teacher batch (default 5).
   - Prompts are batched (`--micro-batch`, which must divide `--batch-size`); the
     startup probe reports the peak for that micro-batch and fails fast rather
     than searching, so the effective batch is reproducible across runs and ranks.
   - Epoch loop over the train split with per-epoch validation on the held-out
     `val` split, per-head-step val loss, and a best-val checkpoint
     (`cache_head_best.ckpt`).
-  - The prefix is the **hybrid student rollout** (the head drives prior head
-    steps), so states match deployment.  `--chain-run-grads` additionally
-    backpropagates through consecutive head-step runs.
+  - Missing trajectories are generated lazily and atomically under
+    `--trajectory-dir`; valid files are loaded in later epochs or runs.
   - This arm skips the LoRA fake-score clone entirely, freeing ~2.6 GB (bf16)
     for a larger micro-batch.
 - `--no-network` runs fully offline: it sets `DIFFSYNTH_SKIP_DOWNLOAD=true` (so
@@ -67,7 +71,7 @@ MotionCache, token selection, or selector training is used.
   glob instead of calling modelscope), passes `skip_download=True` on every
   `ModelConfig`, sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` (the umt5
   tokenizer loads through `AutoTokenizer.from_pretrained` and would otherwise
-  revision-check), and turns W&B off unless `--wandb-mode offline` is given.
+  revision-check), and turns W&B off entirely.
   Point `--model-base-path` at the directory *containing* `<model-id>/`.
 - `--heatmap-every N` renders a per-patch error heat map every N epochs:
   `‖v_head − v_teacher‖₂` over the 64 token channels, reshaped to the `(f, h, w)`
@@ -116,7 +120,9 @@ torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
 # Supervised training on eight GPUs (batched rollouts, epoch + val loop)
 torchrun --standalone --nproc_per_node=8 cache_head_model_training.py \
     --arm supervised --captions mixkit_captions.jsonl \
-    --epochs 20 --batch-size 8 --micro-batch 4 --reg-loss huber \
+    --epochs 20 --batch-size 8 --micro-batch 4 \
+    --optimizer-steps-per-iteration 5 \
+    --trajectory-dir runs/supervised/trajectories \
     --val-subset 128 --heatmap-every 5 --precision bf16 \
     --save-dir runs/supervised \
     --wandb-project cache-head-supervised

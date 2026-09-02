@@ -30,10 +30,11 @@ from fake_score_wan import FakeScoreWan, LoRALinear
 # ═══════════════════════════════════════════════════════════════
 
 def test_schedule_counts():
-    s = CacheHeadSchedule(num_inference_steps=15, full_step_indices=(1, 2, 6, 10, 14))
-    assert s.num_full_steps == 5
-    assert s.num_head_steps == 10
-    assert s.head_step_indices == (3, 4, 5, 7, 8, 9, 11, 12, 13, 15)
+    s = CacheHeadSchedule()
+    assert s.num_full_steps == 7
+    assert s.num_head_steps == 8
+    assert s.full_step_indices == (1, 2, 3, 4, 5, 6, 7)
+    assert s.head_step_indices == (8, 9, 10, 11, 12, 13, 14, 15)
 
 
 def test_schedule_0indexed_mapping():
@@ -88,9 +89,8 @@ def test_parse_full_step_indices_feeds_schedule_validation():
 # CacheHead network
 # ═══════════════════════════════════════════════════════════════
 
-def test_cachehead_random_init_emits_a_nonzero_residual():
-    """A fresh training head has a nonzero random residual."""
-    torch.manual_seed(0)
+def test_cachehead_default_zero_init_is_carry_previous():
+    """Every freshly constructed production head emits exactly zero."""
     head = CacheHead(CacheHeadConfig())
     head.eval()
     grid = (3, 2, 3)
@@ -98,15 +98,14 @@ def test_cachehead_random_init_emits_a_nonzero_residual():
     t = torch.tensor([500.0, 100.0])
     out = head(tokens, t, grid)
     assert out.shape == tokens.shape
-    assert not torch.equal(out, torch.zeros_like(out))
+    assert torch.equal(out, torch.zeros_like(out))
 
 
-def test_cachehead_explicit_zero_init_is_carry_previous():
-    """Only the explicit baseline head emits an exactly-zero residual."""
-    head = CacheHead(CacheHeadConfig(), zero_init_out_proj=True).eval()
+def test_cachehead_random_init_remains_an_explicit_diagnostic_option():
+    head = CacheHead(CacheHeadConfig(), zero_init_out_proj=False).eval()
     tokens = torch.randn(2, 18, 64)
     out = head(tokens, torch.tensor([500.0, 100.0]), (3, 2, 3))
-    assert torch.equal(out, torch.zeros_like(out))
+    assert not torch.equal(out, torch.zeros_like(out))
 
 
 def test_cachehead_forward_shapes_and_grid_mismatch():
@@ -116,8 +115,8 @@ def test_cachehead_forward_shapes_and_grid_mismatch():
         head(torch.randn(1, 60, 64), torch.tensor([500.0]), (3, 4, 4))  # 3*4*4 = 48 != 60
 
 
-def test_cachehead_backpropagates_through_every_parameter():
-    """A velocity target gives every randomly initialized head layer a gradient."""
+def test_cachehead_zero_init_learns_away_from_carry_previous():
+    """The zero output projection receives a gradient and changes after one update."""
     head = CacheHead(CacheHeadConfig())
     head.train()
     grid = (3, 2, 3)
@@ -300,3 +299,22 @@ def test_checkpoint_round_trip_preserves_dtype():
     assert next(loaded.parameters()).dtype == torch.bfloat16
     tokens = torch.randn(1, 24, 64, dtype=torch.bfloat16)
     assert loaded(tokens, torch.tensor([500.0]), (2, 3, 4)).dtype == torch.bfloat16
+
+
+def test_version_one_checkpoint_preserves_legacy_residual_scale(tmp_path):
+    cfg = CacheHeadConfig()
+    head = CacheHead(cfg, zero_init_out_proj=False).eval()
+    path = tmp_path / "legacy.ckpt"
+    save_cache_head(head, cfg, path)
+    payload = torch.load(path, weights_only=False)
+    payload["version"] = 1
+    payload["config"].pop("residual_scale")
+    payload["config"]["version"] = 1
+    torch.save(payload, path)
+
+    loaded, loaded_cfg = load_cache_head(path)
+    tokens = torch.randn(1, 24, 64)
+    timestep = torch.tensor([500.0])
+    expected = head(tokens, timestep, (2, 3, 4)) * 0.1
+    assert loaded_cfg.residual_scale == pytest.approx(0.1)
+    assert torch.allclose(loaded(tokens, timestep, (2, 3, 4)), expected)

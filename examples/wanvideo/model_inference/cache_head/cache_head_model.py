@@ -1,10 +1,10 @@
 """
-CacheHead: a lightweight residual network that replaces ten of fifteen Wan2.1
+CacheHead: a lightweight residual network that replaces eight of fifteen Wan2.1
 denoising calls in a hybrid sampler.
 
 Wan stays frozen.  The default 15-step schedule runs the full Wan model (with
-positive/negative CFG) only at the 1-indexed anchor steps [1, 2, 6, 10, 14];
-the other ten steps use CacheHead.  At a head step the CacheHead predicts a
+positive/negative CFG) at the 1-indexed anchor steps [1, 2, 3, 4, 5, 6, 7];
+the other eight steps use CacheHead.  At a head step the CacheHead predicts a
 residual on top of the nearest preceding guided noise-token prediction:
 
     v_hat_i = v_{i-1} + r_phi(v_{i-1}, t_i)
@@ -16,12 +16,11 @@ residual on top of the nearest preceding guided noise-token prediction:
 Architecture (lightweight token-grid residual network):
 
 RMSNorm -> timestep AdaLN -> channel MLP -> depthwise 3D token-grid mixer
-    -> timestep AdaLN -> small random-initialized output projection.
+    -> timestep AdaLN -> zero-initialized output projection.
 
-Fresh training heads use a small random output projection, so every layer gets
-a learning signal from the first optimizer step.  The explicit
-``zero_init_out_proj`` construction option remains available for the
-``carry_previous`` baseline.
+Fresh heads emit exactly zero residual and therefore reproduce
+``carry_previous`` before training.  New checkpoints add the head residual
+directly; legacy checkpoints retain their historical 0.1 residual scale.
 
 The checkpoint stores the head weights plus the schedule, head architecture,
 and CFG scale so inference is self-describing.
@@ -127,13 +126,16 @@ class CacheHeadConfig:
     freq_dim: int = 256             # sinusoidal timestep embedding width
     mixer_kernel_size: int = 3      # depthwise 3D token-grid mixer kernel
     adaln_dropout: float = 0.0
-    version: int = 1
+    residual_scale: float = 1.0
+    version: int = 2
 
     def __post_init__(self) -> None:
         if self.token_channels < 1:
             raise ValueError(f"token_channels must be >= 1, got {self.token_channels}")
         if self.cfg_scale < 1.0:
             raise ValueError(f"cfg_scale must be >= 1.0 (CFG is distilled into the head), got {self.cfg_scale}")
+        if self.residual_scale <= 0:
+            raise ValueError(f"residual_scale must be positive, got {self.residual_scale}")
         self.schedule.validate()
 
 
@@ -217,12 +219,11 @@ class CacheHead(nn.Module):
     ``[B, S, C]`` which the sampler adds to the nearest preceding guided
     noise-token prediction.
 
-    Fresh training heads use a small random output projection.  Set
-    ``zero_init_out_proj=True`` only to construct the exact
-    ``carry_previous`` baseline.
+    The output projection is zero-initialized by default so a fresh head is the
+    exact ``carry_previous`` baseline.
     """
 
-    def __init__(self, config: CacheHeadConfig, *, zero_init_out_proj: bool = False):
+    def __init__(self, config: CacheHeadConfig, *, zero_init_out_proj: bool = True):
         super().__init__()
         self.config = config
         dim = config.token_channels
@@ -246,9 +247,8 @@ class CacheHead(nn.Module):
         self.adaln2 = TimestepAdaLN(dim, freq_dim=config.freq_dim, dropout=config.adaln_dropout)
         #  this is due to the observation that different timestep have different magnitude of residual
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        # A small random residual gives all layers gradient signal immediately,
-        # unlike an exact-zero projection.  The explicit carry baseline keeps
-        # its old bit-for-bit behaviour through ``zero_init_out_proj``.
+        # Zero init -> residual == 0 -> carry_previous.  The opt-out remains
+        # useful for diagnostics, but all production construction uses zero.
         if zero_init_out_proj:
             nn.init.zeros_(self.out_proj.weight)
         else:
@@ -275,7 +275,7 @@ class CacheHead(nn.Module):
         x = self.mixer(x)
         x = rearrange(x, "b c f h w -> b (f h w) c")
         x = self.adaln2(x, t)
-        return self.out_proj(x)
+        return self.out_proj(x) * self.config.residual_scale
 
 
 # The Strict-DMD fake-score estimator is a *LoRA Wan* (a frozen Wan DiT clone
@@ -325,7 +325,7 @@ def save_cache_head(head: nn.Module, config: CacheHeadConfig, path: str | Path) 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 1,
+        "version": 2,
         "config": _deep_asdict(config),
         "model_state_dict": {k: v.cpu() for k, v in head.state_dict().items()},
     }
@@ -351,9 +351,16 @@ def load_cache_head(
     if not path.is_file():
         raise FileNotFoundError(f"CacheHead checkpoint not found: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if payload.get("version") != 1:
+    checkpoint_version = payload.get("version")
+    if checkpoint_version not in (1, 2):
         raise ValueError(f"Unsupported CacheHead checkpoint version: {payload.get('version')}")
     cfg = dict(payload["config"])
+    # Version-1 checkpoints were trained and deployed with an external /10 in
+    # head_step().  Move that behavior into the self-describing config so the
+    # new direct-add call sites preserve old checkpoints exactly.
+    if checkpoint_version == 1:
+        cfg.setdefault("residual_scale", 0.1)
+        cfg.setdefault("version", 1)
     schedule = CacheHeadSchedule(**cfg["schedule"])
     config = CacheHeadConfig(
         schedule=schedule, **{k: v for k, v in cfg.items() if k != "schedule"}
