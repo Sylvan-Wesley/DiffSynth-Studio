@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 
 from cache_head_model import CacheHeadSchedule, load_cache_head
-from cache_head_model_inference import full_step
+from cache_head_model_inference import full_step, head_step
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -62,8 +62,6 @@ def collect_step_errors(
         ``timesteps``     [num_steps] the Wan timestep at each step
         ``final_latents`` [B, C, F, H, W] the rollout's output, ready to decode
     """
-    from cache_head_model import unpatchify_tokens  # local: keeps import graph flat
-
     f, h, w = grid
     n_batch = latents.shape[0]
     num_steps = schedule.num_inference_steps
@@ -86,7 +84,10 @@ def collect_step_errors(
         teacher_noise, teacher_tokens = full_step(dit, latents, t, ctx, neg_ctx, cfg_scale)
 
         if prev_guided is not None:
-            head_tokens = prev_guided + head(prev_guided, t, grid)
+            head_noise, head_tokens = head_step(
+                head, t, prev_guided, grid, patch_size,
+                current_latents=latents,
+            )
             diff = (head_tokens - teacher_tokens).float()          # [B, S, C]
             err = diff.norm(dim=-1)                                # [B, S]
             rel = err / teacher_tokens.float().norm(dim=-1).clamp_min(1e-6)
@@ -104,7 +105,7 @@ def collect_step_errors(
                 raise RuntimeError(
                     f"head step at progress {k} before any full step; invalid schedule {schedule}"
                 )
-            noise_pred, prev_guided = unpatchify_tokens(head_tokens, grid, patch_size), head_tokens
+            noise_pred, prev_guided = head_noise, head_tokens
         latents = scheduler.step(noise_pred, t, latents)
 
     return {

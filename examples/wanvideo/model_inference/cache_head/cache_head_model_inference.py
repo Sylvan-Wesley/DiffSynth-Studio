@@ -6,7 +6,7 @@ at the anchor steps and the lightweight CacheHead at the remaining steps:
 
     full step:  run full Wan CFG, refresh prev_guided_noise_tokens
     head step:  v_tokens = prev_guided_noise_tokens
-                        + CacheHead(prev_guided_noise_tokens, t)
+                        + CacheHead(prev_guided_noise_tokens, t, current_latent)
                 noise_pred = unpatchify(v_tokens)   (Wan's exact inverse)
 
 All predictions go through the unchanged Wan scheduler step.  No RAS, sparse
@@ -39,6 +39,7 @@ from cache_head_model import (
     CacheHeadConfig,
     CacheHeadSchedule,
     load_cache_head,
+    patchify_latents,
     parse_full_step_indices,
     unpatchify_tokens,
 )
@@ -67,13 +68,29 @@ def full_step(dit, latents, timestep, ctx_posi, ctx_nega, cfg_scale, **dit_kwarg
     return noise_pred, guided_tokens
 
 
-def head_step(head, timestep, prev_guided_tokens, grid, patch_size):
+def head_step(
+    head, timestep, prev_guided_tokens, grid, patch_size, current_latents=None
+):
     """CacheHead denoising step: residual on the nearest preceding guided
     tokens, unpatchified to the latent velocity.
 
     Returns (noise_pred [B,C,F,H,W], v_tokens [B,S,64]).
     """
-    residual = head(prev_guided_tokens, timestep, grid)
+    config = getattr(head, "config", None)
+    if config is None and hasattr(head, "module"):
+        config = getattr(head.module, "config", None)
+    variant = getattr(config, "head_variant", "legacy")
+    if variant == "legacy":
+        # Preserve the historical three-argument call graph for version-1/2
+        # checkpoints and lightweight test/dummy heads.
+        residual = head(prev_guided_tokens, timestep, grid)
+    else:
+        if current_latents is None:
+            raise ValueError(f"head variant {variant!r} requires the live current latent")
+        latent_tokens = patchify_latents(current_latents, grid, patch_size)
+        residual = head(
+            prev_guided_tokens, timestep, grid, latent_tokens=latent_tokens
+        )
     v_tokens = prev_guided_tokens + residual
     noise_pred = unpatchify_tokens(v_tokens, grid, patch_size)
     return noise_pred, v_tokens
@@ -124,15 +141,14 @@ class HybridSampler:
                         f"head step at progress {progress_id} before any full step; "
                         f"invalid schedule {self.schedule}"
                     )
-                # Measure what the head actually contributed, before the add
-                # is committed.  CacheHead starts with RMSNorm, so |residual|
-                # does not scale with |prev_guided|: on large tokens the
-                # relative residual collapses and the low-precision add
-                # discards it outright, leaving output identical to
-                # carry_previous even though the head loaded correctly.
+                # Measure what the head actually contributed before the add is
+                # committed.  A residual below the active dtype's resolution
+                # can be discarded, leaving output identical to carry_previous
+                # even though the head loaded correctly.
                 before = prev_guided
                 noise_pred, prev_guided = head_step(
-                    self.head, t, prev_guided, self.grid, self.patch_size
+                    self.head, t, prev_guided, self.grid, self.patch_size,
+                    current_latents=latents,
                 )
                 residual = prev_guided - before
                 changed = (prev_guided != before).float().mean().item()
@@ -363,8 +379,7 @@ def run_pipeline(args) -> None:
             print("[head effect] WARNING: the head is a no-op at this precision -- "
                   "output will match carry_previous.  Either the head is far from "
                   "converged, or |residual| is too small to survive the add "
-                  "(CacheHead is RMSNorm-fronted, so |residual| does not grow with "
-                  "|tokens|).  Re-run with --precision fp32 to separate the two.")
+                  "at this dtype. Re-run with --precision fp32 to separate the two.")
     counts = {k: stats[k] for k in ("full_calls", "head_calls")}
     print(f"Sampling done in {elapsed:.2f}s: {counts} "
           f"({elapsed / schedule.num_inference_steps * 1000:.0f} ms/step)")

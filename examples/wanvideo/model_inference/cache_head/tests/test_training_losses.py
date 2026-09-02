@@ -8,7 +8,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from cache_head_model import CacheHead, CacheHeadConfig, CacheHeadSchedule, unpatchify_tokens
+from cache_head_model import (
+    CacheHead, CacheHeadConfig, CacheHeadSchedule, patchify_latents, unpatchify_tokens,
+)
+from cache_head_model_inference import full_step
 from cache_head_model_training import (
     CacheHeadTrainer,
     PromptDataset,
@@ -83,16 +86,22 @@ class RecordingHead(CacheHead):
         super().__init__(*args, **kwargs)
         self.calls = 0
 
-    def forward(self, tokens, timestep, grid):
+    def forward(self, tokens, timestep, grid, latent_tokens=None):
         self.calls += 1
-        return super().forward(tokens, timestep, grid)
+        return super().forward(
+            tokens, timestep, grid, latent_tokens=latent_tokens
+        )
 
 
 def _make_trainer(arm="residual_regression", lora_rank=2, **overrides):
     torch.manual_seed(0)
     dit = FakeDit()
     scheduler = FakeScheduler(15)
-    head = RecordingHead(CacheHeadConfig())
+    head_variant = overrides.pop("head_variant", "legacy")
+    head = RecordingHead(CacheHeadConfig(
+        head_variant=head_variant,
+        version=2 if head_variant == "legacy" else 3,
+    ))
     # Non-DMD arms run without the fake-score clone entirely.
     fake = FakeScoreWan(dit, rank=lora_rank, alpha=1.0) if arm in ("dmd", "dmd_plus_reg") else None
     dataset = [("0", "a dog runs"), ("1", "a cat sleeps"), ("2", "a bird flies")]
@@ -401,6 +410,65 @@ def test_supervised_loss_matches_manual_token_space_loss():
     assert torch.allclose(out["loss"], manual)
 
 
+def test_reconstructed_teacher_latents_match_direct_rollout():
+    trainer = _make_trainer("supervised", head_variant="latent_residual")
+    batch = _batch(trainer, 2)
+    teacher = trainer.teacher_guided_trajectory(batch)
+    reconstructed = trainer.reconstruct_teacher_latents(batch["z"], teacher)
+
+    latents = batch["z"]
+    direct_starts = []
+    for k in range(trainer.schedule.num_inference_steps):
+        direct_starts.append(latents)
+        noise, _ = full_step(
+            trainer.dit, latents, trainer._t(k), batch["ctx"],
+            trainer._neg_ctx_for(latents.shape[0]), trainer.cfg,
+        )
+        latents = trainer.scheduler.step(noise, trainer._t(k), latents)
+    direct = torch.stack(direct_starts, dim=1)
+    assert torch.equal(reconstructed, direct)
+
+
+@pytest.mark.parametrize(
+    "variant", ["latent_fusion", "latent_residual", "latent_residual_deep"]
+)
+def test_supervised_latent_variants_receive_xk_previous_velocity_and_vk(variant):
+    trainer = _make_trainer("supervised", head_variant=variant)
+    _perturb_head(trainer)
+    batch = _batch(trainer, 1)
+    teacher = trainer.teacher_guided_trajectory(batch)
+    reconstructed = trainer.reconstruct_teacher_latents(batch["z"], teacher)
+    seen = []
+    original = trainer.head.forward
+
+    def spy(tokens, timestep, grid, latent_tokens=None):
+        seen.append((tokens.detach().clone(), latent_tokens.detach().clone()))
+        return original(tokens, timestep, grid, latent_tokens=latent_tokens)
+
+    trainer.head.forward = spy
+    out = trainer.supervised_teacher_forced(teacher, batch["z"])
+    for (seen_previous, seen_latent), rec in zip(seen, out["per_step"]):
+        k = rec["step"] - 1
+        previous = teacher[:, k - 1]
+        target = teacher[:, k]
+        assert torch.equal(seen_previous, previous)
+        assert torch.equal(
+            seen_latent, patchify_latents(reconstructed[:, k], GRID, PATCH_SIZE)
+        )
+        carry = F.mse_loss(previous.float(), target.float()).item()
+        assert rec["carry_mse"] == pytest.approx(carry)
+        assert rec["relative_improvement"] == pytest.approx(
+            1.0 - rec["loss"] / carry, rel=1e-5
+        )
+
+
+def test_latent_supervision_requires_initial_latents():
+    trainer = _make_trainer("supervised", head_variant="latent_fusion")
+    teacher = trainer.teacher_guided_trajectory(_batch(trainer, 1))
+    with pytest.raises(ValueError, match="requires deterministic initial_latents"):
+        trainer.supervised_teacher_forced(teacher)
+
+
 def test_supervised_batch_matches_two_single_rollouts():
     trainer = _make_trainer("supervised")
     _perturb_head(trainer)
@@ -466,6 +534,20 @@ def test_teacher_trajectory_cache_is_lazy_persistent_and_guided(tmp_path):
     assert torch.equal(second, first)
     assert trainer.trajectory_cache_hits == 1
     assert trainer.trajectory_cache_misses == 1
+
+
+def test_cached_trajectory_uses_same_regenerated_caption_seed(tmp_path):
+    trainer = _make_trainer(
+        "supervised", trajectory_dir=tmp_path, head_variant="latent_residual"
+    )
+    items = [trainer.dataset[0], trainer.dataset[1]]
+    cached = trainer.load_teacher_batch(items, split="train")
+    initial = trainer.deterministic_initial_latents(items, split="train")
+    direct = trainer.teacher_guided_trajectory({
+        "z": initial,
+        "ctx": trainer.encode_captions([caption for _, caption in items]),
+    })
+    assert torch.equal(cached, direct)
 
 
 def test_default_five_optimizer_updates_are_logged_and_sent_to_wandb(tmp_path):

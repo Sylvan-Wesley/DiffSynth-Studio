@@ -16,7 +16,9 @@ from cache_head_model import (
     CacheHead,
     CacheHeadConfig,
     CacheHeadSchedule,
+    HEAD_VARIANTS,
     load_cache_head,
+    patchify_latents,
     parse_full_step_indices,
     save_cache_head,
     token_grid,
@@ -170,6 +172,20 @@ def test_token_grid_and_unpatchify_round_trip():
     assert torch.equal(back, latent)
 
 
+def test_patchify_latents_is_exact_unpatchify_inverse():
+    latent = torch.randn(2, 16, 3, 8, 12)
+    grid = (3, 4, 6)
+    tokens = patchify_latents(latent, grid, (1, 2, 2))
+    assert tokens.shape == (2, 3 * 4 * 6, 64)
+    assert torch.equal(unpatchify_tokens(tokens, grid, (1, 2, 2)), latent)
+
+
+def test_patchify_unpatchify_is_exact_in_both_directions():
+    tokens = torch.randn(2, 24, 64)
+    latent = unpatchify_tokens(tokens, (2, 3, 4), (1, 2, 2))
+    assert torch.equal(patchify_latents(latent, (2, 3, 4), (1, 2, 2)), tokens)
+
+
 # ═══════════════════════════════════════════════════════════════
 # LoRA fake-score estimator
 # ═══════════════════════════════════════════════════════════════
@@ -234,6 +250,38 @@ def test_checkpoint_round_trip():
     )
 
 
+@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+def test_version_three_variant_checkpoint_round_trip(tmp_path, variant):
+    cfg = CacheHeadConfig(head_variant=variant, version=3)
+    head = CacheHead(cfg, zero_init_out_proj=False).eval()
+    path = save_cache_head(head, cfg, tmp_path / f"{variant}.ckpt")
+    payload = torch.load(path, weights_only=False)
+    loaded, loaded_cfg = load_cache_head(path)
+    assert payload["version"] == 3
+    assert loaded_cfg == cfg
+    assert loaded_cfg.head_variant == variant
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(head.state_dict().values(), loaded.state_dict().values())
+    )
+
+
+def test_version_two_checkpoint_without_variant_remains_bit_identical(tmp_path):
+    cfg = CacheHeadConfig()
+    head = CacheHead(cfg, zero_init_out_proj=False).eval()
+    tokens = torch.randn(1, 24, 64)
+    timestep = torch.tensor([500.0])
+    expected = head(tokens, timestep, (2, 3, 4))
+    path = save_cache_head(head, cfg, tmp_path / "v2.ckpt")
+    payload = torch.load(path, weights_only=False)
+    payload["config"].pop("head_variant")
+    torch.save(payload, path)
+
+    loaded, loaded_cfg = load_cache_head(path)
+    assert loaded_cfg.head_variant == "legacy"
+    assert torch.equal(loaded(tokens, timestep, (2, 3, 4)), expected)
+
+
 def test_checkpoint_missing_file():
     with pytest.raises(FileNotFoundError):
         load_cache_head("/nonexistent/path/head.ckpt")
@@ -275,6 +323,61 @@ def test_head_accepts_a_float32_timestep_in_a_bf16_model():
     out = head(tokens, torch.tensor([999.0], dtype=torch.float32), (2, 3, 4))
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out.float()).all()
+
+
+@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_latent_variants_forward_backward_in_every_precision(variant, dtype):
+    cfg = CacheHeadConfig(head_variant=variant, version=3)
+    head = CacheHead(cfg).to(dtype=dtype)
+    tokens = torch.randn(1, 24, 64, dtype=dtype)
+    latent_tokens = torch.randn_like(tokens)
+    out = head(
+        tokens, torch.tensor([500.0], dtype=dtype), (2, 3, 4),
+        latent_tokens=latent_tokens,
+    )
+    assert out.shape == tokens.shape
+    assert out.dtype == dtype
+    assert torch.isfinite(out.float()).all()
+    out.float().pow(2).mean().backward()
+    assert all(p.grad is not None for p in head.parameters())
+
+
+@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+def test_latent_variants_require_exact_latent_token_shape(variant):
+    head = CacheHead(CacheHeadConfig(head_variant=variant, version=3))
+    tokens = torch.randn(1, 24, 64)
+    with pytest.raises(ValueError, match="requires latent_tokens"):
+        head(tokens, torch.tensor([500.0]), (2, 3, 4))
+    with pytest.raises(ValueError, match="must match"):
+        head(tokens, torch.tensor([500.0]), (2, 3, 4), torch.randn(1, 23, 64))
+
+
+@pytest.mark.parametrize("variant", HEAD_VARIANTS[1:])
+def test_zero_init_latent_variants_are_exact_carry(variant):
+    head = CacheHead(CacheHeadConfig(head_variant=variant, version=3))
+    tokens = torch.randn(1, 24, 64)
+    residual = head(
+        tokens, torch.tensor([500.0]), (2, 3, 4),
+        latent_tokens=torch.randn_like(tokens),
+    )
+    assert torch.equal(residual, torch.zeros_like(tokens))
+
+
+def test_residual_variants_have_expected_receptive_field_depth_and_modulation_init():
+    one = CacheHead(CacheHeadConfig(head_variant="latent_residual", version=3))
+    two = CacheHead(CacheHeadConfig(head_variant="latent_residual_deep", version=3))
+    assert len(one.blocks) == 1
+    assert len(two.blocks) == 2
+
+    for block in list(one.blocks) + list(two.blocks):
+        for modulation in (block.mlp_adaln, block.mixer_adaln):
+            weight = modulation.net[-1].weight
+            scale_bias, shift_bias, gate_bias = modulation.net[-1].bias.chunk(3)
+            assert torch.count_nonzero(weight) == 0
+            assert torch.equal(scale_bias, torch.zeros_like(scale_bias))
+            assert torch.equal(shift_bias, torch.zeros_like(shift_bias))
+            assert torch.equal(gate_bias, torch.ones_like(gate_bias))
 
 
 def test_checkpoint_round_trip_preserves_dtype():

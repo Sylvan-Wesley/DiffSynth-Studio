@@ -8,6 +8,7 @@ from cache_head_model import (
     CacheHead,
     CacheHeadConfig,
     CacheHeadSchedule,
+    patchify_latents,
     unpatchify_tokens,
 )
 from cache_head_model_inference import HybridSampler, _build_schedule, full_step, head_step
@@ -77,6 +78,16 @@ class SpyHead(CacheHead):
         return super().forward(tokens, timestep, grid)
 
 
+class LatentSpyHead(CacheHead):
+    def __init__(self):
+        super().__init__(CacheHeadConfig(head_variant="latent_fusion", version=3))
+        self.seen_latents = []
+
+    def forward(self, tokens, timestep, grid, latent_tokens=None):
+        self.seen_latents.append(latent_tokens.detach().clone())
+        return super().forward(tokens, timestep, grid, latent_tokens=latent_tokens)
+
+
 def _make_dit_scheduler():
     return FakeDit(), FakeScheduler(15)
 
@@ -119,6 +130,22 @@ def test_hybrid_schedule_call_counts():
     # Head steps are exactly the 10 non-anchor 0-indexed positions.
     head_steps = [i for i in range(15) if not schedule.is_full_step(i)]
     assert head_steps == [2, 3, 4, 6, 7, 8, 10, 11, 12, 14]
+
+
+def test_hybrid_sampler_supplies_live_latents_to_version_three_head():
+    dit, scheduler = _make_dit_scheduler()
+    head = LatentSpyHead()
+    schedule = CacheHeadSchedule()
+    sampler = HybridSampler(
+        dit, scheduler, head, schedule, cfg_scale=5.0,
+        patch_size=PATCH_SIZE, grid=GRID,
+    )
+    _, states, stats = sampler.sample(_latent(), _ctx(1), _ctx(2))
+
+    assert len(head.seen_latents) == stats["head_calls"] == 8
+    for seen, progress_id in zip(head.seen_latents, range(7, 15)):
+        expected = patchify_latents(states[progress_id], GRID, PATCH_SIZE)
+        assert torch.equal(seen, expected)
 
 
 def test_prev_guided_propagation():

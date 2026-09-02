@@ -3,9 +3,11 @@ CacheHead training harness + loss study.
 
 The supervised arm samples a fixed full-Wan teacher trajectory, persists all
 15 guided CFG token predictions, and trains only on the schedule complement.
-At student step ``k``, teacher tokens from ``k-1`` are the input and teacher
-tokens from ``k`` are the MSE target.  The teacher velocity advances every
-denoising step, so student predictions never alter the training trajectory.
+At student step ``k``, teacher tokens from ``k-1`` are the velocity input and
+teacher tokens from ``k`` are the MSE target.  Version-3 heads also receive the
+current teacher latent, reconstructed from the deterministic initial latent
+and cached velocities.  The teacher velocity advances every denoising step,
+so student predictions never alter the training trajectory.
 Each data iteration repeats this all-student-step update a configurable number
 of times (five by default).
 
@@ -48,7 +50,9 @@ from cache_head_model import (
     CacheHead,
     CacheHeadConfig,
     CacheHeadSchedule,
+    HEAD_VARIANTS,
     parse_full_step_indices,
+    patchify_latents,
     save_cache_head,
     unpatchify_tokens,
 )
@@ -387,7 +391,10 @@ class CacheHeadTrainer:
             if self.schedule.is_full_step(k):
                 noise_pred, prev_guided = full_step(self.dit, latents, t, ctx, self.neg_ctx, self.cfg)
             else:
-                noise_pred, prev_guided = head_step(self.head, t, prev_guided, self.grid, self.patch)
+                noise_pred, prev_guided = head_step(
+                    self.head, t, prev_guided, self.grid, self.patch,
+                    current_latents=latents,
+                )
             latents = self.scheduler.step(noise_pred, t, latents)
         return latents, prev_guided
 
@@ -400,9 +407,11 @@ class CacheHeadTrainer:
         """
         t_j = self._t(step_j)
         sigma_j = self._sigma(step_j)
-        head_out = self.head(prev_guided, t_j, self.grid)
-        v_tokens = prev_guided + head_out
-        noise_pred = unpatchify_tokens(v_tokens, self.grid, self.patch)
+        noise_pred, v_tokens = head_step(
+            self.head, t_j, prev_guided, self.grid, self.patch,
+            current_latents=latents,
+        )
+        head_out = v_tokens - prev_guided
         x0_G = flow_to_x0(latents, noise_pred, sigma_j)
         return v_tokens, noise_pred, x0_G, t_j, sigma_j, head_out
 
@@ -475,7 +484,38 @@ class CacheHeadTrainer:
             latents = self.scheduler.step(noise_pred, t, latents)
         return torch.stack(guided_steps, dim=1)
 
-    def supervised_teacher_forced(self, teacher_guided: torch.Tensor) -> dict:
+    @torch.no_grad()
+    def reconstruct_teacher_latents(
+        self, initial_latents: torch.Tensor, teacher_guided: torch.Tensor
+    ) -> torch.Tensor:
+        """Rebuild each teacher state ``x_k`` from ``x_0`` and cached velocities.
+
+        Returns ``[B,T,C,F,H,W]`` containing the latent at the *start* of each
+        denoising step.  This keeps the persistent cache velocity-only while
+        providing exact current-latent conditioning during supervision.
+        """
+        if initial_latents.shape[0] != teacher_guided.shape[0]:
+            raise ValueError(
+                "initial_latents and teacher_guided must have the same batch size"
+            )
+        if tuple(initial_latents.shape[1:]) != tuple(self.latent_shape[1:]):
+            raise ValueError(
+                f"initial_latents must have shape [B,{','.join(map(str, self.latent_shape[1:]))}], "
+                f"got {tuple(initial_latents.shape)}"
+            )
+        latents = initial_latents.to(device=self.device, dtype=self.dtype)
+        starts = []
+        for k in range(self.schedule.num_inference_steps):
+            starts.append(latents)
+            velocity = unpatchify_tokens(teacher_guided[:, k], self.grid, self.patch)
+            latents = self.scheduler.step(velocity, self._t(k), latents)
+        return torch.stack(starts, dim=1)
+
+    def supervised_teacher_forced(
+        self,
+        teacher_guided: torch.Tensor,
+        initial_latents: torch.Tensor | None = None,
+    ) -> dict:
         """MSE between student and teacher velocities on student steps only.
 
         ``teacher_guided[:, k-1]`` is the student's carry at step ``k`` and
@@ -494,6 +534,17 @@ class CacheHeadTrainer:
                 f"teacher-guided trajectory must have shape {expected}, got "
                 f"{tuple(teacher_guided.shape)}"
             )
+        head_config = self.distributed.unwrap(self.head).config
+        teacher_latents = None
+        if head_config.head_variant != "legacy":
+            if initial_latents is None:
+                raise ValueError(
+                    f"head_variant {head_config.head_variant!r} requires deterministic initial_latents"
+                )
+            teacher_latents = self.reconstruct_teacher_latents(
+                initial_latents, teacher_guided
+            )
+
         total = None
         per_step: list[dict] = []
         for k in range(self.schedule.num_inference_steps):
@@ -503,10 +554,30 @@ class CacheHeadTrainer:
                 raise RuntimeError("step 1 must be a dense/full-teacher step")
             previous_teacher = teacher_guided[:, k - 1].detach()
             teacher_target = teacher_guided[:, k].detach()
-            student = previous_teacher + self.head(previous_teacher, self._t(k), self.grid)
+            if teacher_latents is None:
+                residual = self.head(previous_teacher, self._t(k), self.grid)
+            else:
+                latent_tokens = patchify_latents(
+                    teacher_latents[:, k], self.grid, self.patch
+                )
+                residual = self.head(
+                    previous_teacher, self._t(k), self.grid,
+                    latent_tokens=latent_tokens,
+                )
+            student = previous_teacher + residual
             step_loss = F.mse_loss(student.float(), teacher_target.float())
+            carry_loss = F.mse_loss(previous_teacher.float(), teacher_target.float())
+            relative_improvement = 1.0 - step_loss / carry_loss.clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
             total = step_loss if total is None else total + step_loss
-            per_step.append({"step": k + 1, "loss": float(step_loss.detach().item())})
+            per_step.append({
+                "step": k + 1,
+                "loss": float(step_loss.detach().item()),
+                "raw_mse": float(step_loss.detach().item()),
+                "carry_mse": float(carry_loss.detach().item()),
+                "relative_improvement": float(relative_improvement.detach().item()),
+            })
 
         if total is None:
             raise RuntimeError(f"schedule {self.schedule} has no head steps to supervise")
@@ -516,7 +587,7 @@ class CacheHeadTrainer:
     def supervised_trajectory(self, batch: dict) -> dict:
         """Build an in-memory full-teacher trajectory, then train from it."""
         teacher_guided = self.teacher_guided_trajectory(batch)
-        return self.supervised_teacher_forced(teacher_guided)
+        return self.supervised_teacher_forced(teacher_guided, batch["z"])
 
     # ---- persistent full-teacher trajectory cache ----------------------
 
@@ -563,6 +634,20 @@ class CacheHeadTrainer:
             f"{self.trajectory_seed}\0{split}\0{caption_id}".encode("utf-8")
         ).digest()
         return int.from_bytes(digest[:8], "big") % (2**63 - 1)
+
+    def deterministic_initial_latents(
+        self, items: list[tuple[str, str]], *, split: str
+    ) -> torch.Tensor:
+        """Generate the caption-seeded ``x_0`` shared by caching and replay."""
+        latents = []
+        for caption_id, _ in items:
+            generator = torch.Generator(device="cpu").manual_seed(
+                self._sample_seed(split, str(caption_id))
+            )
+            latents.append(
+                torch.randn(self.latent_shape[1:], generator=generator, dtype=torch.float32)
+            )
+        return torch.stack(latents)
 
     def _load_teacher_trajectory(
         self, path: Path, *, split: str, caption_id: str, caption: str
@@ -640,16 +725,10 @@ class CacheHeadTrainer:
         if missing:
             missing_items = [items[i] for i in missing]
             captions = [caption for _, caption in missing_items]
-            latents = []
-            for caption_id, _ in missing_items:
-                generator = torch.Generator(device="cpu").manual_seed(
-                    self._sample_seed(split, str(caption_id))
-                )
-                latents.append(
-                    torch.randn(self.latent_shape[1:], generator=generator, dtype=torch.float32)
-                )
             batch = {
-                "z": torch.stack(latents).to(device=self.device, dtype=self.dtype),
+                "z": self.deterministic_initial_latents(
+                    missing_items, split=split
+                ).to(device=self.device, dtype=self.dtype),
                 "ctx": self.encode_captions(captions),
             }
             guided = self.teacher_guided_trajectory(batch).detach().cpu()
@@ -810,6 +889,8 @@ class CacheHeadTrainer:
         self.head.eval()
         rng = random.Random(self.seed)
         totals: dict[int, float] = {}
+        carry_totals: dict[int, float] = {}
+        improvement_totals: dict[int, float] = {}
         overall = 0.0
         n_batches = min(self.val_batches, max(1, len(self.val_dataset) // self.micro_batch))
         for _ in range(n_batches):
@@ -820,16 +901,35 @@ class CacheHeadTrainer:
             teacher_guided = self.load_teacher_batch(items, split="val").to(
                 device=self.device, dtype=self.dtype
             )
-            out = self.supervised_teacher_forced(teacher_guided)
+            initial_latents = self.deterministic_initial_latents(items, split="val")
+            out = self.supervised_teacher_forced(teacher_guided, initial_latents)
             overall += float(out["loss"].detach().item())
             for rec in out["per_step"]:
                 totals[rec["step"]] = totals.get(rec["step"], 0.0) + rec["loss"]
+                carry_totals[rec["step"]] = (
+                    carry_totals.get(rec["step"], 0.0) + rec["carry_mse"]
+                )
+                improvement_totals[rec["step"]] = (
+                    improvement_totals.get(rec["step"], 0.0)
+                    + rec["relative_improvement"]
+                )
         if was_training:
             self.head.train()
         return {
             "val_loss": self.distributed.mean_float(overall / n_batches),
             "val_per_step": {
                 k: self.distributed.mean_float(v / n_batches) for k, v in sorted(totals.items())
+            },
+            "val_raw_mse_per_step": {
+                k: self.distributed.mean_float(v / n_batches) for k, v in sorted(totals.items())
+            },
+            "val_carry_per_step": {
+                k: self.distributed.mean_float(v / n_batches)
+                for k, v in sorted(carry_totals.items())
+            },
+            "val_relative_improvement_per_step": {
+                k: self.distributed.mean_float(v / n_batches)
+                for k, v in sorted(improvement_totals.items())
             },
         }
 
@@ -862,26 +962,39 @@ class CacheHeadTrainer:
                 for micro_step in range(accum):
                     chunk = order[cursor:cursor + self.micro_batch]
                     cursor += self.micro_batch
-                    cached_micro_batches.append(
-                        self.load_teacher_batch(chunk, split="train")
-                    )
+                    cached_micro_batches.append((
+                        self.load_teacher_batch(chunk, split="train"),
+                        self.deterministic_initial_latents(chunk, split="train"),
+                    ))
 
                 iteration = epoch * steps_per_epoch + iteration_in_epoch
                 for inner_step in range(self.optimizer_steps_per_iteration):
                     self.head_opt.zero_grad(set_to_none=True)
                     micro_losses = []
                     per_step_acc: dict[int, float] = {}
-                    for micro_step, cached in enumerate(cached_micro_batches):
+                    per_step_carry_acc: dict[int, float] = {}
+                    per_step_improvement_acc: dict[int, float] = {}
+                    for micro_step, (cached, initial_latents) in enumerate(cached_micro_batches):
                         with self.distributed.no_sync(
                             self.head, enabled=micro_step < accum - 1
                         ):
                             teacher_guided = cached.to(device=self.device, dtype=self.dtype)
-                            out = self.supervised_teacher_forced(teacher_guided)
+                            out = self.supervised_teacher_forced(
+                                teacher_guided, initial_latents
+                            )
                             (out["loss"] / accum).backward()
                             micro_losses.append(float(out["loss"].detach().item()))
                             for rec in out["per_step"]:
                                 per_step_acc[rec["step"]] = (
                                     per_step_acc.get(rec["step"], 0.0) + rec["loss"]
+                                )
+                                per_step_carry_acc[rec["step"]] = (
+                                    per_step_carry_acc.get(rec["step"], 0.0)
+                                    + rec["carry_mse"]
+                                )
+                                per_step_improvement_acc[rec["step"]] = (
+                                    per_step_improvement_acc.get(rec["step"], 0.0)
+                                    + rec["relative_improvement"]
                                 )
                     grad_norm = float(
                         torch.nn.utils.clip_grad_norm_(self.head.parameters(), self.grad_clip)
@@ -908,6 +1021,16 @@ class CacheHeadTrainer:
                         "grad_norm": grad_norm,
                         "fake_score_loss": float("nan"),
                         "per_step": {k: v / accum for k, v in sorted(per_step_acc.items())},
+                        "raw_mse_per_step": {
+                            k: v / accum for k, v in sorted(per_step_acc.items())
+                        },
+                        "carry_per_step": {
+                            k: v / accum for k, v in sorted(per_step_carry_acc.items())
+                        },
+                        "relative_improvement_per_step": {
+                            k: v / accum
+                            for k, v in sorted(per_step_improvement_acc.items())
+                        },
                         "finite": finite,
                     }
                     if self.distributed.is_main_process:
@@ -1040,6 +1163,10 @@ def main() -> None:
         ),
     )
     parser.add_argument("--arm", choices=list(TRAINING_ARMS), required=True)
+    parser.add_argument(
+        "--head-variant", choices=list(HEAD_VARIANTS), default="legacy",
+        help="CacheHead architecture for the controlled latent-conditioning ablation",
+    )
     parser.add_argument("--captions", required=True, help="MixKit caption JSONL path")
     parser.add_argument("--model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
     parser.add_argument("--no-network", action="store_true",
@@ -1226,7 +1353,13 @@ def run_training(args: argparse.Namespace, distributed: DistributedContext) -> N
         raise ValueError("supervised teacher forcing requires step 1 in --full-steps")
     if args.arm == "supervised" and schedule.num_head_steps == 0:
         raise ValueError("supervised teacher forcing requires at least one student step")
-    config = CacheHeadConfig(model_id=args.model_id, schedule=schedule, cfg_scale=args.cfg)
+    config = CacheHeadConfig(
+        model_id=args.model_id,
+        schedule=schedule,
+        cfg_scale=args.cfg,
+        head_variant=args.head_variant,
+        version=2 if args.head_variant == "legacy" else 3,
+    )
     head = CacheHead(config).to(device=device, dtype=dtype)
     # FakeScoreWan deep-copies the whole DiT; only the DMD arms need it, and
     # skipping it frees that memory for a larger --micro-batch.
